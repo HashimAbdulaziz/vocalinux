@@ -489,7 +489,13 @@ class TestCheckDependencies(unittest.TestCase):
         )
         self.assertFalse(self._not_applied(logs.output))
 
-    def _run_ibus_pin(self, bridges, desktop="Hyprland", env=None):
+    def _run_ibus_pin(
+        self,
+        bridges: bool,
+        desktop: str = "Hyprland",
+        env: Any = None,
+        config_pin: bool = False,
+    ) -> tuple[list[str], int]:
         """Drive _check_dependencies with an ibus pin; return (logs, bridge_call_count)."""
         from vocalinux.text_injection.text_injector import DesktopEnvironment, TextInjector
 
@@ -500,15 +506,24 @@ class TestCheckDependencies(unittest.TestCase):
             calls.append(1)
             return bridges
 
+        environ = {
+            "XDG_SESSION_TYPE": "wayland",
+            "XDG_CURRENT_DESKTOP": desktop,
+        }
+        if not config_pin:
+            environ["VOCALINUX_FORCE_BACKEND"] = "ibus"
+
         with (
             patch.dict(
                 os.environ,
-                {
-                    "XDG_SESSION_TYPE": "wayland",
-                    "XDG_CURRENT_DESKTOP": desktop,
-                    "VOCALINUX_FORCE_BACKEND": "ibus",
-                },
+                environ,
                 clear=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.config_dir", return_value="/fake/config"),
+            patch("os.path.exists", return_value=True),
+            patch(
+                "builtins.open",
+                mock_open(read_data=json.dumps({"text_injection": {"backend": "ibus"}})),
             ),
             patch.object(TextInjector, "_wayland_compositor_bridges_ibus", fake_bridges),
             patch("vocalinux.text_injection.text_injector.is_ibus_available", return_value=True),
@@ -555,6 +570,17 @@ class TestCheckDependencies(unittest.TestCase):
             self._silent_failure_warnings(output),
             f"expected no silent-failure warning on a bridged compositor, got: {output}",
         )
+
+    def test_config_ibus_pin_checks_the_compositor_bridge(self):
+        """A saved IBus pin follows the same denylist warning as an env pin."""
+        for bridges in (False, True):
+            with self.subTest(bridges=bridges):
+                output, _ = self._run_ibus_pin(bridges=bridges, config_pin=True)
+                if bridges:
+                    self.assertFalse(self._silent_failure_warnings(output))
+                else:
+                    self.assertTrue(self._silent_failure_warnings(output))
+                self.assertTrue([line for line in output if "text_injection.backend=ibus" in line])
 
     def test_ibus_pin_never_double_checks_the_compositor(self):
         """The bridging check shells out (pgrep / gdbus), so it must run at most once.

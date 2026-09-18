@@ -2785,7 +2785,7 @@ class TestConfiguredBackend(unittest.TestCase):
     """text_injection.backend in config.json pins the injection backend (#476)."""
 
     def test_recognised_backends(self):
-        for value in ("ibus", "wtype", "ydotool"):
+        for value in ("ibus", "wtype", "ydotool", "xdotool"):
             with _fake_config({"text_injection": {"backend": value}}):
                 self.assertEqual(TextInjector._configured_backend(), value)
 
@@ -2969,7 +2969,7 @@ class TestForcedBackendSetting(unittest.TestCase):
             self.assertIsNone(TextInjector._forced_backend_setting())
 
     def test_recognised_backends_are_returned(self):
-        for value in ("ibus", "wtype", "ydotool"):
+        for value in ("ibus", "wtype", "ydotool", "xdotool"):
             with patch.dict("os.environ", {"VOCALINUX_FORCE_BACKEND": value.upper()}):
                 self.assertEqual(TextInjector._forced_backend_setting(), value)
 
@@ -2988,7 +2988,7 @@ class TestForcedBackend(unittest.TestCase):
                 self.assertEqual(TextInjector._forced_backend(), "auto")
 
     def test_recognised_backends(self):
-        for value in ("ibus", "wtype", "ydotool"):
+        for value in ("ibus", "wtype", "ydotool", "xdotool"):
             with patch.dict("os.environ", {"VOCALINUX_FORCE_BACKEND": value.upper()}):
                 self.assertEqual(TextInjector._forced_backend(), value)
 

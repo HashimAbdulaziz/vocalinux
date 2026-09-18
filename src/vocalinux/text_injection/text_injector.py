@@ -502,7 +502,7 @@ class TextInjector:
         variable exists for. Collapsing it into "nothing was set" would let the
         saved pin win and make the variable useless for that.
 
-        Accepts ``ibus``, ``wtype``, ``ydotool`` or ``auto``.
+        Accepts ``ibus``, ``wtype``, ``ydotool``, ``xdotool`` or ``auto``.
         """
         raw = os.environ.get("VOCALINUX_FORCE_BACKEND")
         if raw is None:
@@ -567,7 +567,7 @@ class TextInjector:
         when the inference is wrong, and makes the two paths A/B-testable
         without editing code.
 
-        Accepts ``ibus``, ``wtype``, ``ydotool`` or ``auto``. Anything else is
+        Accepts ``ibus``, ``wtype``, ``ydotool``, ``xdotool`` or ``auto``. Anything else is
         ignored with a warning, so a typo cannot silently pin a backend.
 
         This covers the environment variable only. ``_backend_preference()``

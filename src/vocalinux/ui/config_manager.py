@@ -143,7 +143,7 @@ DEFAULT_CONFIG = {
         # Ctrl+Shift+V when a nested terminal panel is not detected.
         "paste_shortcut": "auto",
         # Text-injection backend: "auto" autodetects, or pin "ibus"/"wtype"/
-        # "ydotool" when the autodetection is wrong for your compositor (#476).
+        # "ydotool"/"xdotool" when autodetection is wrong (#476).
         # VOCALINUX_FORCE_BACKEND overrides this for a single run.
         "backend": "auto",
     },
