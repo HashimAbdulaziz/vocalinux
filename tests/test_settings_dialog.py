@@ -658,7 +658,8 @@ class TestSettingsDialogHelperFunctions(unittest.TestCase):
         self.assertIn("largest model", MODEL_SIZE_TOOLTIP)
         self.assertIn("Standard multilingual", MODEL_SPECIALIZATION_TOOLTIP)
         self.assertIn("English-only", LANGUAGE_TOOLTIP)
-        self.assertIn("Type to search", LANGUAGE_TOOLTIP)
+        self.assertIn("Search the list", LANGUAGE_TOOLTIP)
+        self.assertNotIn("limit this list to English", LANGUAGE_TOOLTIP)
         self.assertIn("only in English", _model_specialization_tooltip("medium.en"))
         self.assertIn("lower-memory systems", _model_specialization_tooltip("medium-q5_0"))
         self.assertIn("Turbo", _model_specialization_tooltip("large-v3-turbo"))
@@ -705,7 +706,7 @@ class TestSettingsDialogHelperFunctions(unittest.TestCase):
                 "mock hardware reason",
                 "en-us",
             ),
-            ("medium.en", "mock hardware reason; English language selected"),
+            ("medium.en", "mock hardware reason"),
         )
         self.assertEqual(_default_whispercpp_variant_for_size("medium", "en-us"), "medium.en")
 
@@ -730,6 +731,7 @@ class TestSettingsDialogHelperFunctions(unittest.TestCase):
         self.assertEqual(_whispercpp_variant_for_language("medium", "auto"), "medium")
         self.assertEqual(_whispercpp_variant_for_language("medium.en", "auto"), "medium")
         self.assertEqual(_whispercpp_variant_for_language("medium.en", "fr"), "medium")
+        self.assertEqual(_whispercpp_variant_for_language("small.en", "pl"), "small")
 
         # Quantized pairs mirror with language when a match exists.
         self.assertEqual(
@@ -747,6 +749,27 @@ class TestSettingsDialogHelperFunctions(unittest.TestCase):
             "large-v3-turbo",
         )
         self.assertEqual(_whispercpp_variant_for_language("large", "en-us"), "large")
+
+    def test_english_only_model_does_not_hide_other_languages(self):
+        """Picking .en used to filter the language list, so Polish could not be chosen."""
+        import os
+
+        source_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "src",
+            "vocalinux",
+            "ui",
+            "settings_dialog.py",
+        )
+        with open(source_path, "r") as handle:
+            source_code = handle.read()
+
+        populate = source_code.split("def _populate_language_options")[1].split("\n    def ")[0]
+        default = source_code.split("def _default_language_for_engine")[1].split("\n    def ")[0]
+        self.assertNotIn("english_only_whispercpp", populate)
+        self.assertNotIn('lang_info.get("whisper") != "en"', populate)
+        self.assertNotIn("_is_selected_whispercpp_model_english_only", default)
 
     def test_whisper_delete_unknown_model(self):
         """Test deleting an unknown Whisper model raises ValueError."""
@@ -770,7 +793,8 @@ class TestSettingsDialogHelperFunctions(unittest.TestCase):
         with open(source_path, "r") as handle:
             source_code = handle.read()
 
-        self.assertIn('label="Unused downloads"', source_code)
+        self.assertIn('"Unused downloads"', source_code)
+        self.assertIn("self.content_box.pack_start(self.unused_island", source_code)
         self.assertIn("self.unused_expander", source_code)
         self.assertIn("self._on_unused_download_delete_clicked", source_code)
         self.assertNotIn('title="Remove Model"', source_code)
@@ -831,7 +855,7 @@ class TestLanguageComboSearch(unittest.TestCase):
         self.assertIn("completion.set_text_column(0)", source_code)
         self.assertIn("Search languages…", source_code)
         self.assertIn("def _commit_or_restore_language_entry", source_code)
-        self.assertIn("Type to search, or pick from the list", source_code)
+        self.assertIn("Search or pick from the list", source_code)
 
     def test_dictation_tone_picker_in_source(self):
         import os
@@ -1081,6 +1105,7 @@ class TestAboutPage(unittest.TestCase):
         self.assertIn("After a model is downloaded", self.about)
         self.assertIn("Private dictation for Linux, Mac, Windows, and phone.", self.about)
         self.assertIn("Android beta / iOS TestFlight", self.source)
+        self.assertIn("Windows, unsigned beta", self.source)
         self.assertIn("Self-hosted, headless", self.source)
         self.assertNotIn("iOS source build", self.source)
         self.assertNotIn("SmartScreen", self.about)
@@ -1096,6 +1121,7 @@ class TestAboutPage(unittest.TestCase):
             "https://vocalinux.com",
             "https://vocahq.com",
             "https://vocamac.com",
+            "https://vocawin.com",
             "https://vocaphone.vocahq.com",
             "https://vocagateway.vocahq.com",
             "https://github.com/VocaHQ/vocalinux/issues",
@@ -1122,6 +1148,7 @@ class TestAboutPage(unittest.TestCase):
             "Open vocahq.com",
             "Open vocalinux.com",
             "Open vocamac.com",
+            "Open vocawin.com",
             "Open vocaphone.vocahq.com",
             "Open vocagateway.vocahq.com",
             "Open the Vocalinux GitHub repository",
@@ -1160,6 +1187,7 @@ class TestAboutPage(unittest.TestCase):
         self.assertIn("def _family_tile", self.source)
         self.assertIn("platform-linux", self.source)
         self.assertIn("platform-apple", self.source)
+        self.assertIn("platform-windows", self.source)
         self.assertIn("platform-android", self.source)
         self.assertIn("platform-server", self.source)
         self.assertIn("platform-home", self.source)
@@ -1181,6 +1209,7 @@ class TestAboutPage(unittest.TestCase):
             VOCALINUX_SITE_URL,
             VOCAMAC_SITE_URL,
             VOCAPHONE_SITE_URL,
+            VOCAWIN_SITE_URL,
             _can_open_url,
         )
 
@@ -1188,6 +1217,7 @@ class TestAboutPage(unittest.TestCase):
             VOCALINUX_SITE_URL,
             VOCAHQ_SITE_URL,
             VOCAMAC_SITE_URL,
+            VOCAWIN_SITE_URL,
             VOCAPHONE_SITE_URL,
             VOCAGATEWAY_SITE_URL,
             GITHUB_REPO_URL,
@@ -1293,6 +1323,7 @@ class TestAboutPage(unittest.TestCase):
         for name, title in (
             ("platform-linux", "Linux"),
             ("platform-apple", "Apple"),
+            ("platform-windows", "Windows"),
             ("platform-android", "Android"),
             ("platform-server", "Server"),
             ("platform-home", "Home"),

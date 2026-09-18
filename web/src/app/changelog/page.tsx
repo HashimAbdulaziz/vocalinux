@@ -15,6 +15,33 @@ import { absoluteUrl, buildPageMetadata } from "@/lib/seo";
 
 const releases = [
   {
+    version: "v0.17.0",
+    date: "2026-09-16",
+    type: "stable",
+    highlights: [
+      "Faster Whisper engine: CTranslate2 / INT8 Whisper on CPU, optional extra, installer --engine=faster_whisper (PR #543)",
+      "Parakeet TDT 0.6B via sherpa-onnx: default v3-european bundle or v2-english, installer --engine=parakeet (PR #802)",
+      "Speech Model simple setup: language + speed/accuracy first; engine/size under Advanced (PR #801)",
+      "First run seeds recognition language from keyboard layout / locale (PR #796, #777)",
+      "Language picker filters while the list is open (PR #798)",
+      "Recommended model button sets size and specialization together and will not ignore a file already on disk (PR #797, #778)",
+      "Localized punctuation voice commands for it/fr/de/es/pt/nl/pl/ru (PR #642, #640)",
+      "Bare F1–F24 push-to-talk shortcuts (PR #815)",
+      "Snap packaging with ydotool and uinput for native Wayland; GitHub .snap sideload while Store review of uinput is pending (PR #519, #823, #822)",
+      "Release workflow attaches Vocalinux-<version>-{x86_64,aarch64}.flatpak (PR #786, #784)",
+      "XWayland clipboard paste instead of layout-garbled xdotool type (PR #680, #657)",
+      "Layout-aware Ctrl+V paste; ydotool releases Ctrl after a timed-out paste (PR #788, #675, #658)",
+      "Read WM_CLASS with xprop so xdotool stops dumping core on KDE Plasma Wayland (PR #807)",
+      "Settings freeze on already-downloaded model, English whisper.cpp .en variant, PTT tray redraw, sink-wake audio cues, Parakeet decode survival (PR #790, #795, #780, #809, #804, #803)",
+      "English-only models no longer hide other languages; picking Polish or auto-detect switches to the multilingual sibling (PR #826)",
+      "Speech Model copy and Unused downloads as a sibling expander of Advanced; VocaWin on the About family grid (PR #826)",
+      "install.sh: Faster Whisper is CPU CTranslate2/INT8; GPU backend does not install the CUDA toolkit (PR #826)",
+      "HDA analog mics (3-8 channel) open at native layout instead of forced 2ch/48kHz; capture is downmixed to mono (PR #829, fixes #813)",
+      "Native GTK installs (AUR / install.sh) follow OS dark/light; skipped when GTK_THEME is set so AppImage and user overrides stay in charge (PR #830, fixes #816)",
+      "Lock-derived Flatpak/AUR deps, hash-pinned exports for every engine extra, published-release verification, install.sh distro matrix (PR #819, #828, #791, #810)",
+    ],
+  },
+  {
     version: "v0.16.2",
     date: "2026-09-05",
     type: "stable",
@@ -29,6 +56,7 @@ const releases = [
       "CI: gate AUR PKGBUILD builds on every PR; test the distros the docs promise and fix docs drift (PR #772, #773)",
       "Site: VocaGateway family card is Beta; README logo, badges, and privacy copy (PR #765, #764)",
       "Deps: bump the github-actions group (PR #766)",
+      "Snap 0.16.2 edge (rev 7) has no uinput plug: snap connect vocalinux:uinput fails, and dictation only reaches XWayland apps. A later store snap ships ydotool; refresh, then connect uinput (PR #823)",
     ],
   },
   {

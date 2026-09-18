@@ -20,7 +20,6 @@ UX Design Notes:
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
@@ -35,6 +34,19 @@ from gi.repository import Gdk, GLib, GObject, Gtk, Pango  # noqa: E402
 from ..common_types import RecognitionState  # noqa: E402
 from ..speech_recognition.silero_vad import is_silero_available  # noqa: E402
 from ..utils import parakeet_model_info as parakeet  # noqa: E402
+from ..utils.faster_whisper_model_info import (
+    FASTER_WHISPER_MODEL_INFO,
+)
+from ..utils.faster_whisper_model_info import delete_model as delete_faster_whisper_model
+from ..utils.faster_whisper_model_info import (  # noqa: E402
+    get_recommended_model as get_recommended_faster_whisper_model,
+)
+from ..utils.faster_whisper_model_info import (
+    is_model_downloaded as is_faster_whisper_model_downloaded,
+)
+from ..utils.faster_whisper_model_info import (
+    list_downloaded_models as list_downloaded_faster_whisper_models,
+)
 from ..utils.model_choice import (
     BALANCED,
     PRIORITIES,
@@ -160,6 +172,13 @@ ENGINE_MODELS = {
     "parakeet": [
         *parakeet.MODEL_SIZES,
     ],  # Parakeet TDT 0.6B int8 bundles
+    "faster_whisper": [
+        "tiny",
+        "base",
+        "small",
+        "medium",
+        "large-v3",
+    ],  # faster-whisper models mirror OpenAI Whisper sizes
     "remote_api": [],  # Remote API does not need local models
 }
 
@@ -178,6 +197,7 @@ ENGINE_DISPLAY_NAMES = {
     "whisper": "Whisper",
     "whisper_cpp": "whisper.cpp",
     "parakeet": "Parakeet",
+    "faster_whisper": "Faster Whisper",
     "remote_api": "Remote API",
 }
 
@@ -304,7 +324,7 @@ def _recommended_whispercpp_variant_for_language(
     english_variant = f"{recommended_size}.en"
 
     if _language_is_english(language_id) and english_variant in WHISPERCPP_MODEL_INFO:
-        return english_variant, f"{reason}; English language selected"
+        return english_variant, reason
 
     return recommended_model, reason
 
@@ -431,6 +451,7 @@ def _combo_with_suffix(
 VOCALINUX_SITE_URL = "https://vocalinux.com"
 VOCAHQ_SITE_URL = "https://vocahq.com"
 VOCAMAC_SITE_URL = "https://vocamac.com"
+VOCAWIN_SITE_URL = "https://vocawin.com"
 VOCAPHONE_SITE_URL = "https://vocaphone.vocahq.com"
 VOCAGATEWAY_SITE_URL = "https://vocagateway.vocahq.com"
 GITHUB_REPO_URL = __url__
@@ -445,6 +466,7 @@ _ABOUT_OPEN_URLS = frozenset(
         VOCALINUX_SITE_URL,
         VOCAHQ_SITE_URL,
         VOCAMAC_SITE_URL,
+        VOCAWIN_SITE_URL,
         VOCAPHONE_SITE_URL,
         VOCAGATEWAY_SITE_URL,
         GITHUB_REPO_URL,
@@ -493,16 +515,9 @@ def _about_surface_is_dark() -> bool:
         except Exception:
             pass
     try:
-        from ..utils.host_process import host_env
+        from ..utils.gtk_color_scheme import read_os_color_scheme
 
-        result = subprocess.run(
-            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
-            capture_output=True,
-            text=True,
-            timeout=1,
-            env=host_env(),
-        )
-        if result.returncode == 0 and "prefer-dark" in (result.stdout or "").lower():
+        if read_os_color_scheme() == "prefer-dark":
             return True
     except Exception:
         pass
@@ -555,6 +570,13 @@ _VOCAHQ_FAMILY_LINKS = (
         "Open vocamac.com",
     ),
     (
+        VOCAWIN_SITE_URL,
+        "VocaWin",
+        "Windows, unsigned beta",
+        ("platform-windows",),
+        "Open vocawin.com",
+    ),
+    (
         VOCAPHONE_SITE_URL,
         "VocaPhone",
         "Android beta / iOS TestFlight",
@@ -599,8 +621,8 @@ MODEL_SPECIALIZATION_TOOLTIP = (
     "lower-memory quantized models, Turbo speed, or a legacy large model."
 )
 LANGUAGE_TOOLTIP = (
-    "Choose the language you dictate in. Type to search the list. English-only model "
-    "specializations limit this list to English."
+    "Choose the language you dictate in. Search the list. Picking a language "
+    "other than English switches off an English-only model."
 )
 
 
@@ -676,6 +698,7 @@ def get_available_engines():
         "whisper": False,
         "whisper_cpp": False,
         "parakeet": False,
+        "faster_whisper": False,
         "remote_api": False,
     }
 
@@ -708,6 +731,13 @@ def get_available_engines():
         import sherpa_onnx  # noqa: F401
 
         engines["parakeet"] = True
+    except ImportError:
+        pass
+
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+
+        engines["faster_whisper"] = True
     except ImportError:
         pass
 
@@ -1022,12 +1052,26 @@ spinbutton {
     margin-right: 8px;
 }
 
-/* Unused downloads: one collapsed row until expanded */
-.unused-downloads-expander {
-    padding: 8px 12px;
+/* Sibling expander cards on Speech Model (Advanced, Unused downloads).
+   Padding lives on the expander, not the title class: .preferences-group-title
+   already has 16px inset, which stacked with expander margin and shoved the
+   chevron off the unused-downloads title. */
+.expander-card expander {
+    padding: 10px 12px;
 }
 
-.unused-downloads-expander list {
+.expander-card-title {
+    font-weight: bold;
+    font-size: 0.9em;
+    color: @theme_unfocused_fg_color;
+}
+
+.expander-card-subtitle {
+    font-size: 0.85em;
+    color: @theme_unfocused_fg_color;
+}
+
+.expander-card list {
     background-color: transparent;
 }
 
@@ -1168,7 +1212,7 @@ class SearchablePicker(Gtk.Box):
         self.pack_start(self._button, True, True, 0)
 
         self._search = Gtk.SearchEntry()
-        self._search.set_placeholder_text("Type to search…")
+        self._search.set_placeholder_text("Search…")
         self._search.connect("search-changed", self._on_search_changed)
         self._search.connect("activate", self._on_search_activate)
 
@@ -1521,6 +1565,9 @@ def recommended_model_for_engine(
         model_id = parakeet.RECOMMENDED_MODEL
         reason = parakeet.RECOMMENDED_REASON
         size_mb = parakeet.PARAKEET_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
+    elif engine == "faster_whisper":
+        model_id, reason = get_recommended_faster_whisper_model()
+        size_mb = FASTER_WHISPER_MODEL_INFO.get(model_id, {}).get("size_mb", 0)
     else:
         # Remote API transcribes server-side; there is nothing to download.
         return None
@@ -1597,6 +1644,14 @@ def _gdk_keyname_to_token(name: Optional[str]) -> Optional[str]:
     return None
 
 
+def _shortcut_from_capture(modifiers: list[str], token: Optional[str]) -> Optional[str]:
+    """Build a canonical shortcut from recorded modifiers and a main key."""
+    if token is None:
+        return None
+    candidate = "+".join((*modifiers, token)) if modifiers else token
+    return candidate if is_valid_shortcut(candidate) else None
+
+
 def _row_matches_query(query: str, title: str, subtitle: str = "", keywords=()) -> bool:
     """Return whether a settings row matches a search query.
 
@@ -1608,6 +1663,30 @@ def _row_matches_query(query: str, title: str, subtitle: str = "", keywords=()) 
         return True
     haystacks = [title or "", subtitle or "", *keywords]
     return any(query in text.casefold() for text in haystacks)
+
+
+def _make_expander_card(
+    title: str, subtitle: str
+) -> tuple[Gtk.Box, Gtk.Expander, Gtk.Box, Gtk.Label]:
+    """Card with a compact title+subtitle expander, used for Advanced and Unused."""
+    island = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    island.get_style_context().add_class("preferences-group")
+    island.get_style_context().add_class("expander-card")
+
+    expander = Gtk.Expander()
+    header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    title_label = Gtk.Label(label=title, xalign=0)
+    title_label.get_style_context().add_class("expander-card-title")
+    subtitle_label = Gtk.Label(label=subtitle, xalign=0, wrap=True)
+    subtitle_label.get_style_context().add_class("expander-card-subtitle")
+    header.pack_start(title_label, False, False, 0)
+    header.pack_start(subtitle_label, False, False, 0)
+    expander.set_label_widget(header)
+
+    body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    expander.add(body)
+    island.pack_start(expander, False, False, 0)
+    return island, expander, body, subtitle_label
 
 
 class PreferencesGroup(Gtk.Box):
@@ -1966,6 +2045,8 @@ class SettingsDialog(Gtk.Dialog):
         self.advanced_box = None
         self.advanced_island = None
         self.advanced_expander = None
+        self.unused_island = None
+        self.unused_expander = None
         self.simple_page = None
         self.simple_group = None
         self.engine_group = None
@@ -2985,7 +3066,7 @@ class SettingsDialog(Gtk.Dialog):
 
     def _build_simple_model_section(self):
         """Build the simple questions and the Advanced reveal (#779)."""
-        self.simple_group = PreferencesGroup(title="What you dictate")
+        self.simple_group = PreferencesGroup(title="Language")
 
         # Searchable, like the advanced row: over thirty languages is too many to
         # scroll, and a list you cannot type into is a step backwards.
@@ -3005,7 +3086,7 @@ class SettingsDialog(Gtk.Dialog):
             )
         self.simple_language_row = PreferenceRow(
             title="Main language",
-            subtitle="Type to search, or pick from the list",
+            subtitle="Search or pick from the list",
             widget=self.simple_language_combo,
             keywords=("language", "speak"),
         )
@@ -3016,8 +3097,8 @@ class SettingsDialog(Gtk.Dialog):
         self.simple_multi_switch = Gtk.Switch()
         self.simple_multi_switch.set_valign(Gtk.Align.CENTER)
         self.simple_multi_row = PreferenceRow(
-            title="I also dictate whole texts in other languages",
-            subtitle="Detects the language per utterance; can be wrong on short ones",
+            title="Other languages",
+            subtitle="Guesses the language each time. Short clips can be wrong.",
             widget=self.simple_multi_switch,
             keywords=("multilingual", "auto", "detect"),
         )
@@ -3029,7 +3110,7 @@ class SettingsDialog(Gtk.Dialog):
         # First entry is the multilingual answer: any language, detected per
         # utterance. Naming one specific second language means the same thing
         # to the engine, but lets the user say which one they had in mind.
-        self.simple_second_language_combo.append("auto", "Any language (auto-detect)")
+        self.simple_second_language_combo.append("auto", "Any language")
         for language_id, info in SUPPORTED_LANGUAGES.items():
             if language_id != "auto":
                 self.simple_second_language_combo.append(language_id, info["name"])
@@ -3040,7 +3121,7 @@ class SettingsDialog(Gtk.Dialog):
             title="Other language",
             # Honest about what the engine does: whisper takes one language or
             # none, so any second language means detection per utterance.
-            subtitle="Recognition detects the language of each utterance",
+            subtitle="Or pick Any language to auto-detect",
             widget=self.simple_second_language_combo,
             keywords=("second", "language", "other"),
         )
@@ -3053,8 +3134,8 @@ class SettingsDialog(Gtk.Dialog):
         for priority in PRIORITIES:
             self.simple_priority_combo.append(priority, PRIORITY_LABELS[priority])
         self.simple_priority_row = PreferenceRow(
-            title="Priority",
-            subtitle="Balanced follows what your hardware can run",
+            title="Speed vs accuracy",
+            subtitle="Balanced is the default for this computer",
             widget=self.simple_priority_combo,
             keywords=("speed", "accuracy", "priority"),
         )
@@ -3072,33 +3153,17 @@ class SettingsDialog(Gtk.Dialog):
         # it could not be raised above the dialog at all. Both cards visible at
         # once also makes the expanded rows a readout of what the simple answers
         # resolved to.
-        self.advanced_island = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.advanced_island.get_style_context().add_class("preferences-group")
-
-        self.advanced_expander = Gtk.Expander()
-        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        title = Gtk.Label(label="Advanced", xalign=0)
-        title.get_style_context().add_class("preferences-group-title")
-        subtitle = Gtk.Label(
-            label="Engine, model size, specialization, downloads and the remote server",
-            xalign=0,
-            wrap=True,
+        (
+            self.advanced_island,
+            self.advanced_expander,
+            self.advanced_box,
+            _,
+        ) = _make_expander_card(
+            "Advanced",
+            "Engine, model, and remote server",
         )
-        subtitle.get_style_context().add_class("preference-row-subtitle")
-        header.pack_start(title, False, False, 0)
-        header.pack_start(subtitle, False, False, 0)
-        self.advanced_expander.set_label_widget(header)
-        self.advanced_expander.set_margin_top(12)
-        self.advanced_expander.set_margin_bottom(12)
-        self.advanced_expander.set_margin_start(16)
-        self.advanced_expander.set_margin_end(16)
-
-        # Everything the detailed view holds is packed in here; the sections
-        # built after this one append to it.
-        self.advanced_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.advanced_box.set_spacing(12)
         self.advanced_box.set_margin_top(8)
-        self.advanced_expander.add(self.advanced_box)
-        self.advanced_island.pack_start(self.advanced_expander, False, False, 0)
         self.content_box.pack_start(self.advanced_island, False, False, 0)
 
         self.advanced_expander.connect("notify::expanded", self._on_advanced_expanded)
@@ -3129,7 +3194,7 @@ class SettingsDialog(Gtk.Dialog):
         self.model_combo.set_tooltip_text(MODEL_SIZE_TOOLTIP)
         _prevent_scroll_on_hover(self.model_combo)
         self.model_row = PreferenceRow(
-            title="Model Size",
+            title="Model size",
             subtitle="Larger models are more accurate but slower",
             widget=self.model_combo,
         )
@@ -3161,7 +3226,7 @@ class SettingsDialog(Gtk.Dialog):
             language_entry.connect("focus-out-event", self._on_language_entry_focus_out)
         self.language_row = PreferenceRow(
             title="Language",
-            subtitle="Type to search, or pick from the list",
+            subtitle="Search or pick from the list",
             widget=self.language_combo,
         )
         self.language_row.set_tooltip_text(LANGUAGE_TOOLTIP)
@@ -3212,19 +3277,20 @@ class SettingsDialog(Gtk.Dialog):
         # priority or language change did anything, and what it will cost.
         self.simple_page.pack_start(self.model_info_card, False, False, 0)
 
+        (
+            self.unused_island,
+            self.unused_expander,
+            unused_body,
+            self.unused_expander_subtitle,
+        ) = _make_expander_card(
+            "Unused downloads",
+            "Downloaded, but not the one in use",
+        )
         self.unused_models_group = PreferencesGroup(
             keywords=("delete", "remove", "unused", "disk", "storage", "downloaded"),
         )
-        self.unused_models_group.title = "Unused downloads"
-        self.unused_models_group.description = "On disk, but not the model currently selected"
-
-        self.unused_expander = Gtk.Expander(label="Unused downloads")
-        self.unused_expander.set_expanded(False)
-        self.unused_expander.set_use_underline(False)
-        self.unused_expander.set_tooltip_text(
-            "Leftover model files on disk. Expand to delete them one at a time."
-        )
-        self.unused_expander.get_style_context().add_class("unused-downloads-expander")
+        # The island is the card; this group only holds rows for search/delete.
+        self.unused_models_group.get_style_context().remove_class("preferences-group")
 
         self.unused_models_scroll = Gtk.ScrolledWindow()
         self.unused_models_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -3241,15 +3307,16 @@ class SettingsDialog(Gtk.Dialog):
         self.unused_models_group.remove(self.unused_models_group.listbox)
         list_holder.pack_start(self.unused_models_group.listbox, False, False, 0)
         self.unused_models_scroll.add(list_holder)
-        self.unused_expander.add(self.unused_models_scroll)
-        # Backstop: the refresh measures while the expander is collapsed and
-        # the dialog may not be mapped yet. Remeasure when the user expands,
-        # so a short first measurement can never leave the list clipped.
+        self.unused_models_group.pack_start(self.unused_models_scroll, False, False, 0)
+        unused_body.pack_start(self.unused_models_group, False, False, 0)
+        self.unused_expander.set_expanded(False)
+        # Refresh may run while collapsed or before map. Remeasure on expand
+        # and on map so a short first measurement cannot leave rows clipped.
         self.unused_expander.connect(
             "notify::expanded", lambda *_args: self._fit_unused_downloads_height()
         )
-        self.unused_models_group.pack_start(self.unused_expander, False, False, 0)
-        self.advanced_box.pack_start(self.unused_models_group, False, False, 0)
+        self.unused_models_scroll.connect("map", lambda *_args: self._fit_unused_downloads_height())
+        self.content_box.pack_start(self.unused_island, False, False, 0)
 
         # Connect signals
         self.engine_combo.connect("changed", self._on_engine_changed)
@@ -3392,11 +3459,13 @@ class SettingsDialog(Gtk.Dialog):
         self.voice_commands_switch = Gtk.Switch()
         self.voice_commands_switch.set_tooltip_text(
             "Enable voice commands like 'new line', 'period', 'undo', etc.\n"
+            "Punctuation phrases also match the recognition language "
+            "(e.g. Italian 'virgola', French 'virgule').\n"
             "Useful for VOSK engine. Whisper engines handle punctuation automatically."
         )
         voice_commands_row = PreferenceRow(
             title="Voice Commands",
-            subtitle="Say 'new line', 'period', 'undo' while dictating",
+            subtitle="Say 'new line', 'period', 'undo' (localized punctuation too)",
             widget=self.voice_commands_switch,
             keywords=("punctuation", "editing"),
         )
@@ -3568,10 +3637,10 @@ class SettingsDialog(Gtk.Dialog):
         # something the preset modifiers can't express (split keyboards, etc.).
         custom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.custom_shortcut_entry = Gtk.Entry()
-        self.custom_shortcut_entry.set_placeholder_text("e.g. alt+r")
+        self.custom_shortcut_entry.set_placeholder_text("e.g. alt+r or f10")
         self.custom_shortcut_entry.set_width_chars(12)
         self.custom_shortcut_entry.set_tooltip_text(
-            "A modifier plus a key, e.g. alt+r, ctrl+alt+r, super+space"
+            "A modifier plus a key (alt+r) or a function key (f10)"
         )
         self.custom_shortcut_entry.connect("activate", self._on_custom_shortcut_apply)
         custom_box.pack_start(self.custom_shortcut_entry, False, False, 0)
@@ -3588,7 +3657,7 @@ class SettingsDialog(Gtk.Dialog):
 
         self.custom_shortcut_row = PreferenceRow(
             title="Custom Shortcut",
-            subtitle="Modifier + key combo (great for split keyboards)",
+            subtitle="Modifier + key, or a function key",
             widget=custom_box,
             keywords=("record", "keybinding", "hotkey"),
         )
@@ -3702,7 +3771,7 @@ class SettingsDialog(Gtk.Dialog):
             self.shortcut_info_label.set_markup(
                 f"<span foreground='#e01b24'>Invalid shortcut: "
                 f"<b>{GLib.markup_escape_text(shortcut or '(empty)')}</b>. "
-                "Try a modifier + key, e.g. alt+r.</span>"
+                "Try a modifier + key (alt+r) or a function key (f10).</span>"
             )
             return
 
@@ -3745,7 +3814,7 @@ class SettingsDialog(Gtk.Dialog):
         self._recording_shortcut = True
         self.record_shortcut_button.set_label("Press keys…")
         self.shortcut_info_label.set_markup(
-            "<i>Press a modifier + key (e.g. Alt+R). Press Esc to cancel.</i>"
+            "<i>Press a modifier + key (e.g. Alt+R), or an F-key. Press Esc to cancel.</i>"
         )
 
     def _stop_recording_shortcut(self):
@@ -3766,9 +3835,7 @@ class SettingsDialog(Gtk.Dialog):
         if state & Gdk.ModifierType.SUPER_MASK:
             modifiers.append("super")
         token = _gdk_keyname_to_token(Gdk.keyval_name(event.keyval))
-        if not modifiers or token is None:
-            return None
-        return "+".join(modifiers + [token])
+        return _shortcut_from_capture(modifiers, token)
 
     def _on_shortcut_key_press(self, widget, event):
         """Capture a pressed combo while recording; otherwise pass through."""
@@ -3791,8 +3858,8 @@ class SettingsDialog(Gtk.Dialog):
             self._apply_custom_shortcut(shortcut)
         else:
             self.shortcut_info_label.set_markup(
-                "<span foreground='#e01b24'>Need a modifier + key. "
-                "Try again or press Esc to cancel.</span>"
+                "<span foreground='#e01b24'>Need a modifier + key, or an F1–F24 "
+                "function key alone. Try again or press Esc to cancel.</span>"
             )
         return True
 
@@ -3908,7 +3975,7 @@ class SettingsDialog(Gtk.Dialog):
             self._set_custom_shortcut_row_visible(True)
             self.custom_shortcut_entry.grab_focus()
             self.shortcut_info_label.set_markup(
-                "<i>Record or type a custom shortcut (e.g. alt+r), then click Set.</i>"
+                "<i>Record or type a custom shortcut (e.g. alt+r or f10), then click Set.</i>"
             )
             return
 
@@ -5209,7 +5276,7 @@ class SettingsDialog(Gtk.Dialog):
 
     def _default_language_for_engine(self, engine: str) -> str:
         """Return a safe default language for the selected engine and model."""
-        if engine == "vosk" or self._is_selected_whispercpp_model_english_only():
+        if engine == "vosk":
             return "en-us"
         return "auto"
 
@@ -5306,6 +5373,8 @@ class SettingsDialog(Gtk.Dialog):
                 recommended_model, _ = _get_recommended_whisper_model()
             elif engine == "parakeet":
                 recommended_model = parakeet.RECOMMENDED_MODEL
+            elif engine == "faster_whisper":
+                recommended_model, _ = get_recommended_faster_whisper_model()
             else:
                 recommended_model, _ = _get_recommended_vosk_model()
 
@@ -5314,6 +5383,9 @@ class SettingsDialog(Gtk.Dialog):
                     if engine == "whisper" and size in WHISPER_MODEL_INFO:
                         info = WHISPER_MODEL_INFO[size]
                         is_downloaded = _is_whisper_model_downloaded(size)
+                    elif engine == "faster_whisper" and size in FASTER_WHISPER_MODEL_INFO:
+                        info = FASTER_WHISPER_MODEL_INFO[size]
+                        is_downloaded = is_faster_whisper_model_downloaded(size)
                     elif engine == "vosk" and size in VOSK_MODEL_INFO:
                         info = VOSK_MODEL_INFO[size]
                         is_downloaded = _is_vosk_model_downloaded(size, self.language)
@@ -5470,6 +5542,9 @@ class SettingsDialog(Gtk.Dialog):
         if engine == "parakeet":
             model_id = self.model_combo.get_active_id()
             return model_id.lower() if model_id else None
+        if engine == "faster_whisper":
+            model_id = self.model_combo.get_active_id()
+            return model_id.lower() if model_id else None
         return None
 
     def _list_unused_downloads(self) -> list[tuple[str, str, str]]:
@@ -5536,27 +5611,37 @@ class SettingsDialog(Gtk.Dialog):
                         name == active_id,
                     )
                 )
+        elif engine == "faster_whisper":
+            for name in list_downloaded_faster_whisper_models():
+                items.append(
+                    (
+                        name,
+                        _model_display_name(name),
+                        _format_size(FASTER_WHISPER_MODEL_INFO[name]["size_mb"]),
+                        name == active_id,
+                    )
+                )
 
         return items
 
     def _refresh_unused_downloads(self):
         """Rebuild the Unused downloads list, or hide it when empty."""
-        if not hasattr(self, "unused_models_group"):
+        if not hasattr(self, "unused_models_group") or self.unused_island is None:
             return
 
         if self._get_selected_engine() == "remote_api":
-            self.unused_models_group.hide()
+            self.unused_island.hide()
             return
 
         unused = self._list_unused_downloads()
         self.unused_models_group.clear_rows()
         if not unused:
-            self.unused_models_group.hide()
+            self.unused_island.hide()
             return
 
         count = len(unused)
-        leftover = "leftover model" if count == 1 else "leftover models"
-        self.unused_expander.set_label(f"Unused downloads ({count} {leftover})")
+        leftover = "unused model" if count == 1 else "unused models"
+        self.unused_expander_subtitle.set_text(f"{count} {leftover} on disk")
 
         was_expanded = self.unused_expander.get_expanded()
         for model_id, title, size_label in unused:
@@ -5577,7 +5662,7 @@ class SettingsDialog(Gtk.Dialog):
             )
             self.unused_models_group.add_row(row)
 
-        self.unused_models_group.show_all()
+        self.unused_island.show_all()
         self.unused_expander.set_expanded(was_expanded)
         self._fit_unused_downloads_height()
 
@@ -5589,6 +5674,10 @@ class SettingsDialog(Gtk.Dialog):
         was cut off below the edge of the viewport while the header still
         counted it (#683).
         """
+        if not hasattr(self, "unused_models_scroll"):
+            return
+        if self.unused_expander is not None and not self.unused_expander.get_expanded():
+            return
         _, natural_height = self.unused_models_group.listbox.get_preferred_height()
         self.unused_models_scroll.set_min_content_height(
             _clamp_unused_downloads_height(natural_height)
@@ -5622,6 +5711,8 @@ class SettingsDialog(Gtk.Dialog):
             delete_vosk_model(model_id)
         elif engine == "parakeet":
             parakeet.delete_model(model_id)
+        elif engine == "faster_whisper":
+            delete_faster_whisper_model(model_id)
         else:
             raise ValueError(f"No local models to delete for engine {engine}")
 
@@ -5829,7 +5920,6 @@ class SettingsDialog(Gtk.Dialog):
             return
 
         engine = _engine_from_display(engine)
-        english_only_whispercpp = self._is_selected_whispercpp_model_english_only()
 
         for lang_code, lang_info in SUPPORTED_LANGUAGES.items():
             display_text = lang_info["name"]
@@ -5840,10 +5930,9 @@ class SettingsDialog(Gtk.Dialog):
                     continue
                 is_downloaded = _is_vosk_model_downloaded("small", lang_code)
                 display_text += " ✓" if is_downloaded else " ↓"
-            elif engine in ["whisper", "whisper_cpp", "parakeet", "remote_api"]:
-                if english_only_whispercpp and lang_info.get("whisper") != "en":
-                    continue
-                # Both Whisper and whisper.cpp support auto-detect
+            elif engine in ["whisper", "whisper_cpp", "parakeet", "faster_whisper", "remote_api"]:
+                # An English-only model must not hide other languages: picking
+                # Polish (or auto) retargets to the multilingual sibling.
                 if lang_code == "auto":
                     display_text += " ⚠"
             else:
@@ -5863,8 +5952,7 @@ class SettingsDialog(Gtk.Dialog):
 
         if self._is_selected_whispercpp_model_english_only():
             self.language_warning.set_markup(
-                "<span foreground='#e5a50a'>⚠ English-only model selected. "
-                "Language choices are limited to English.</span>"
+                "<span foreground='#e5a50a'>⚠ This model only understands English.</span>"
             )
             self.language_warning.show()
         elif lang_info.get("warning"):
@@ -5886,7 +5974,7 @@ class SettingsDialog(Gtk.Dialog):
         """
         if self._processing_language_change:
             return
-        if self._initializing or self._applying_settings:
+        if self._initializing or self._applying_settings or self._simple_driving:
             return
 
         lang_code = self.language_combo.get_active_id()
@@ -6177,7 +6265,8 @@ class SettingsDialog(Gtk.Dialog):
         if is_remote:
             self.model_row.hide()
             self.model_variant_row.hide()
-            self.unused_models_group.hide()
+            if self.unused_island is not None:
+                self.unused_island.hide()
             self.model_info_card.hide()
             self.remote_server_group.show_all()
             self.remote_status_label.show()
@@ -6282,6 +6371,14 @@ class SettingsDialog(Gtk.Dialog):
             is_downloaded = parakeet.is_model_downloaded(model_name)
             recommended, reason = parakeet.RECOMMENDED_MODEL, parakeet.RECOMMENDED_REASON
             extra_info = f"Size: {_format_size(info['size_mb'])}"
+        elif engine == "faster_whisper":
+            if model_name not in FASTER_WHISPER_MODEL_INFO:
+                self.model_info_card.hide()
+                return
+            info = FASTER_WHISPER_MODEL_INFO[model_name]
+            is_downloaded = is_faster_whisper_model_downloaded(model_name)
+            recommended, reason = get_recommended_faster_whisper_model()
+            extra_info = f"Parameters: {info['params']}"
         else:
             self.model_info_card.hide()
             return
@@ -6304,8 +6401,8 @@ class SettingsDialog(Gtk.Dialog):
             if already_have and already_have != model_name:
                 target = already_have
                 message = (
-                    f"You already have {_model_display_name(already_have)} on disk — "
-                    "using it needs no download"
+                    f"You already have {_model_display_name(already_have)} on disk. "
+                    "Using it needs no download."
                 )
 
         if target == model_name:
@@ -6370,6 +6467,9 @@ class SettingsDialog(Gtk.Dialog):
             elif engine == "parakeet" and not parakeet.is_model_downloaded(model_name):
                 needs_download = True
                 model_info = parakeet.PARAKEET_MODEL_INFO.get(model_name, {"size_mb": 639})
+            elif engine == "faster_whisper" and not is_faster_whisper_model_downloaded(model_name):
+                needs_download = True
+                model_info = FASTER_WHISPER_MODEL_INFO.get(model_name, {"size_mb": 39})
 
             if needs_download:
                 if not self.speech_engine.try_begin_download():
@@ -6829,6 +6929,9 @@ For now, the engine has been reverted to VOSK."""
         elif engine == "parakeet" and not parakeet.is_model_downloaded(model_name):
             needs_download = True
             model_info = parakeet.PARAKEET_MODEL_INFO.get(model_name, {"size_mb": 639})
+        elif engine == "faster_whisper" and not is_faster_whisper_model_downloaded(model_name):
+            needs_download = True
+            model_info = FASTER_WHISPER_MODEL_INFO.get(model_name, {"size_mb": 39})
 
         if needs_download:
             if not self.speech_engine.try_begin_download():

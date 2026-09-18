@@ -23,12 +23,11 @@ if "gi" not in sys.modules:
 if "gi.repository" not in sys.modules:
     sys.modules["gi.repository"] = MagicMock()
 
+from vocalinux.common_types import RecognitionState
 from vocalinux.speech_recognition.recognition_manager import SpeechRecognitionManager
-from vocalinux.utils.model_checksums import (
-    VERIFICATION_STAMP_NAME,
-    ChecksumError,
-    expected_for,
-)
+from vocalinux.utils.faster_whisper_model_info import manifest_key as faster_whisper_manifest_key
+from vocalinux.utils.faster_whisper_model_info import model_files as faster_whisper_model_files
+from vocalinux.utils.model_checksums import VERIFICATION_STAMP_NAME, ChecksumError, expected_for
 from vocalinux.utils.model_checksums import verify_model_file as verify_model_file_real
 from vocalinux.utils.parakeet_model_info import MODEL_FILES as PARAKEET_MODEL_FILES
 from vocalinux.utils.parakeet_model_info import manifest_key as parakeet_manifest_key
@@ -40,13 +39,14 @@ def _make_manager(engine="whisper_cpp", **kw):
         with patch.object(SpeechRecognitionManager, "_init_whisper"):
             with patch.object(SpeechRecognitionManager, "_init_whispercpp"):
                 with patch.object(SpeechRecognitionManager, "_init_parakeet"):
-                    mgr = SpeechRecognitionManager(
-                        engine=engine,
-                        model_size="small",
-                        language="en-us",
-                        defer_download=True,
-                        **kw,
-                    )
+                    with patch.object(SpeechRecognitionManager, "_init_faster_whisper"):
+                        mgr = SpeechRecognitionManager(
+                            engine=engine,
+                            model_size="small",
+                            language="en-us",
+                            defer_download=True,
+                            **kw,
+                        )
                     # Ensure vosk_model_map is set (normally done in _init_vosk)
                     if not hasattr(mgr, "vosk_model_map"):
                         # The names _init_vosk() would pick for en-us. They have to be
@@ -802,6 +802,279 @@ class TestParakeetDownloadVerifiesExistingFiles:
             os.path.basename(path) == encoder_name + ".tmp" for path in streamed
         ), "an existing bad file must be removed and re-downloaded"
         assert encoder.read_bytes() == b"good-enough"
+
+
+class TestFasterWhisperRejectsAnUnverifiedModelOnDisk:
+    """Wiring test: the hash has to happen where the model is picked up."""
+
+    @staticmethod
+    def _write_bundle(tmp_path, payload=b"not the model that is pinned"):
+        model_dir = tmp_path / "tiny"
+        model_dir.mkdir()
+        for name in faster_whisper_model_files("tiny"):
+            (model_dir / name).write_bytes(payload)
+        return model_dir
+
+    def test_a_model_that_fails_its_pin_is_removed_and_not_loaded(self, tmp_path):
+        model_dir = self._write_bundle(tmp_path)
+
+        manager = _make_manager(engine="faster_whisper")
+        manager.model_size = "tiny"
+        manager._defer_download = True
+
+        with patch(
+            "vocalinux.speech_recognition.recognition_manager.faster_whisper.get_model_path",
+            return_value=str(model_dir),
+        ):
+            with patch(
+                "vocalinux.speech_recognition.engines.faster_whisper_engine.FasterWhisperEngine"
+            ) as engine_cls:
+                manager._init_faster_whisper()
+
+        for name in faster_whisper_model_files("tiny"):
+            assert not (model_dir / name).exists(), "an unverifiable model must not stay on disk"
+        engine_cls.assert_not_called()
+        assert manager._model_initialized is False
+
+    def test_a_model_that_cannot_be_deleted_is_still_not_loaded(self, tmp_path):
+        model_dir = self._write_bundle(tmp_path)
+
+        manager = _make_manager(engine="faster_whisper")
+        manager.model_size = "tiny"
+        manager._defer_download = False
+
+        with patch(
+            "vocalinux.speech_recognition.recognition_manager.faster_whisper.get_model_path",
+            return_value=str(model_dir),
+        ):
+            with patch(
+                "vocalinux.speech_recognition.recognition_manager.os.remove",
+                side_effect=OSError("read-only"),
+            ):
+                with patch(
+                    "vocalinux.speech_recognition.engines.faster_whisper_engine.FasterWhisperEngine"
+                ) as engine_cls:
+                    with pytest.raises(RuntimeError, match="failed verification"):
+                        manager._init_faster_whisper()
+
+        for name in faster_whisper_model_files("tiny"):
+            assert (model_dir / name).exists()
+        engine_cls.assert_not_called()
+
+    def test_an_unpinned_model_is_refused_not_deleted(self, tmp_path):
+        """faster-whisper pins are constructed keys; simulate a missing pin for one file."""
+        model_dir = self._write_bundle(tmp_path, payload=b"bytes")
+        unpinned_name = faster_whisper_model_files("tiny")[0]
+        unpinned_key = faster_whisper_manifest_key("tiny", unpinned_name)
+
+        def fake_verify(path, filename=None):
+            key = filename or os.path.basename(path)
+            if key == unpinned_key:
+                raise ChecksumError(f"No checksum is pinned for {key}")
+            verify_model_file_real(path, filename)
+
+        def fake_expected(filename):
+            if os.path.basename(filename) == unpinned_key:
+                return None
+            return expected_for(filename)
+
+        manager = _make_manager(engine="faster_whisper")
+        manager.model_size = "tiny"
+        manager._defer_download = True
+
+        with patch(
+            "vocalinux.speech_recognition.recognition_manager.faster_whisper.get_model_path",
+            return_value=str(model_dir),
+        ):
+            with patch(
+                "vocalinux.speech_recognition.recognition_manager.verify_model_file",
+                side_effect=fake_verify,
+            ):
+                with patch(
+                    "vocalinux.speech_recognition.recognition_manager.expected_for",
+                    side_effect=fake_expected,
+                ):
+                    with patch(
+                        "vocalinux.speech_recognition.engines.faster_whisper_engine.FasterWhisperEngine"
+                    ) as engine_cls:
+                        manager._init_faster_whisper()
+
+        assert (
+            model_dir / unpinned_name
+        ).exists(), "a missing pin is not a reason to delete the file"
+        engine_cls.assert_not_called()
+        assert manager._model_initialized is False
+
+
+class TestFasterWhisperDownloadVerifiesExistingFiles:
+    """Existence is not a pin: a leftover dest must still match its digest."""
+
+    def test_an_existing_file_that_fails_its_pin_is_redownloaded(self, tmp_path):
+        manager = _make_manager(engine="faster_whisper")
+        manager.model_size = "tiny"
+        model_dir = tmp_path / "tiny"
+        model_dir.mkdir()
+
+        first_name = faster_whisper_model_files("tiny")[0]
+        first_file = model_dir / first_name
+        first_file.write_bytes(b"not the file that is pinned")
+        first_key = faster_whisper_manifest_key("tiny", first_name)
+
+        streamed = []
+        verify_calls = []
+
+        def fake_stream(url, dest_path):
+            streamed.append(dest_path)
+            with open(dest_path, "wb") as handle:
+                handle.write(b"good-enough")
+
+        def fake_verify(path, filename=None):
+            verify_calls.append((path, filename))
+            if not str(path).endswith(".tmp"):
+                raise ChecksumError("digest mismatch")
+
+        mock_requests = MagicMock()
+        mock_requests.exceptions.RequestException = Exception
+
+        with patch.dict("sys.modules", {"requests": mock_requests}):
+            with patch(
+                "vocalinux.speech_recognition.recognition_manager.faster_whisper.get_model_path",
+                return_value=str(model_dir),
+            ):
+                with patch.object(manager, "_stream_model_download", side_effect=fake_stream):
+                    with patch(
+                        "vocalinux.speech_recognition.recognition_manager.verify_model_file",
+                        side_effect=fake_verify,
+                    ):
+                        manager._download_faster_whisper_model()
+
+        assert any(
+            path == str(first_file) and filename == first_key for path, filename in verify_calls
+        ), "an existing dest must be hashed, not skipped because it is already on disk"
+        assert any(
+            os.path.basename(path) == first_name + ".tmp" for path in streamed
+        ), "an existing bad file must be removed and re-downloaded"
+        assert first_file.read_bytes() == b"good-enough"
+
+
+class TestFailedReconfigureRestoresPreviousEngine:
+    """A failed faster-whisper switch must not discard the live engine.
+
+    Settings reverts the pickers to the saved config on error. If reconfigure
+    keeps faster-whisper in ERROR after releasing whisper.cpp, dictation is
+    dead until restart even though the UI shows the old engine.
+    """
+
+    def test_failed_faster_whisper_download_reloads_previous_engine(self):
+        manager = _make_manager(engine="whisper_cpp")
+        manager.engine = "whisper_cpp"
+        manager.model_size = "tiny"
+        manager._model_initialized = True
+        manager.state = RecognitionState.IDLE
+
+        with patch.object(
+            manager, "_init_faster_whisper", side_effect=RuntimeError("download failed")
+        ):
+            with patch.object(manager, "_init_whispercpp") as restore_init:
+                with pytest.raises(RuntimeError, match="download failed"):
+                    manager.reconfigure(
+                        engine="faster_whisper",
+                        model_size="tiny",
+                        force_download=True,
+                    )
+                restore_init.assert_called_once()
+
+        assert manager.engine == "whisper_cpp"
+        assert manager.model_size == "tiny"
+        assert manager.state != RecognitionState.ERROR
+
+    def test_restore_failure_stays_in_error(self):
+        manager = _make_manager(engine="whisper_cpp")
+        manager.engine = "whisper_cpp"
+        manager.model_size = "tiny"
+        manager.state = RecognitionState.IDLE
+
+        with patch.object(
+            manager, "_init_faster_whisper", side_effect=RuntimeError("download failed")
+        ):
+            with patch.object(
+                manager, "_init_whispercpp", side_effect=RuntimeError("restore failed")
+            ):
+                with pytest.raises(RuntimeError, match="download failed"):
+                    manager.reconfigure(
+                        engine="faster_whisper",
+                        model_size="tiny",
+                        force_download=True,
+                    )
+
+        assert manager.engine == "whisper_cpp"
+        assert manager.state == RecognitionState.ERROR
+
+    def test_failed_switch_restores_live_settings_not_just_engine(self):
+        """Unsaved VAD/device/API fields must roll back with the previous engine."""
+        manager = _make_manager(engine="whisper_cpp")
+        manager.engine = "whisper_cpp"
+        manager.model_size = "tiny"
+        manager.language = "en-us"
+        manager.vad_sensitivity = 2
+        manager.silence_timeout = 1.5
+        manager.audio_device_index = 1
+        manager.audio_device_name = "Built-in Mic"
+        manager._voice_commands_preference = False
+        manager.stop_sound_guard_ms = 200
+        manager.whispercpp_n_threads = 4
+        manager.whispercpp_gpu_device = 0
+        manager.whispercpp_no_timestamps = True
+        manager.remote_api_url = "http://old"
+        manager.remote_api_key = "old-key"
+        manager.remote_api_endpoint = "/inference"
+        manager.remote_api_model = "whisper-1"
+        manager._model_initialized = True
+        manager.state = RecognitionState.IDLE
+
+        with patch.object(
+            manager, "_init_faster_whisper", side_effect=RuntimeError("download failed")
+        ):
+            with patch.object(manager, "_init_whispercpp") as restore_init:
+                with pytest.raises(RuntimeError, match="download failed"):
+                    manager.reconfigure(
+                        engine="faster_whisper",
+                        model_size="tiny",
+                        vad_sensitivity=5,
+                        silence_timeout=4.0,
+                        audio_device_index=9,
+                        audio_device_name="USB Mic",
+                        voice_commands_enabled=True,
+                        stop_sound_guard_ms=50,
+                        whispercpp_n_threads=1,
+                        whispercpp_gpu_device=2,
+                        whispercpp_no_timestamps=False,
+                        remote_api_url="http://new",
+                        remote_api_key="new-key",
+                        remote_api_endpoint="/v1/audio",
+                        remote_api_model="sensevoice",
+                        force_download=True,
+                    )
+                restore_init.assert_called_once()
+
+        assert manager.engine == "whisper_cpp"
+        assert manager.model_size == "tiny"
+        assert manager.language == "en-us"
+        assert manager.vad_sensitivity == 2
+        assert manager.silence_timeout == 1.5
+        assert manager.audio_device_index == 1
+        assert manager.audio_device_name == "Built-in Mic"
+        assert manager._voice_commands_preference is False
+        assert manager._voice_commands_enabled is False
+        assert manager.stop_sound_guard_ms == 200
+        assert manager.whispercpp_n_threads == 4
+        assert manager.whispercpp_gpu_device == 0
+        assert manager.whispercpp_no_timestamps is True
+        assert manager.remote_api_url == "http://old"
+        assert manager.remote_api_key == "old-key"
+        assert manager.remote_api_endpoint == "/inference"
+        assert manager.remote_api_model == "whisper-1"
+        assert manager.state != RecognitionState.ERROR
 
 
 class TestAudioReconnection:

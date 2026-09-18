@@ -168,6 +168,47 @@ class TestTextInjector(unittest.TestCase):
             # Should fall back to XWayland
             self.assertEqual(injector.environment, DesktopEnvironment.WAYLAND_XDOTOOL)
 
+    def test_wayland_wtype_fail_prefers_ydotool_over_xdotool(self) -> None:
+        """wtype rejection must not skip ydotool; xdotool is XWayland-only."""
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland"}):
+            self.mock_which.side_effect = lambda cmd: {
+                "wtype": "/usr/bin/wtype",
+                "ydotool": "/usr/bin/ydotool",
+                "xdotool": "/usr/bin/xdotool",
+            }.get(cmd)
+
+            mock_process = MagicMock()
+            mock_process.returncode = 1
+            mock_process.stderr = "compositor does not support virtual keyboard protocol"
+            self.mock_subprocess.return_value = mock_process
+
+            with patch.object(TextInjector, "_uinput_usable", return_value=True):
+                injector = TextInjector()
+
+            self.assertEqual(injector.environment, DesktopEnvironment.WAYLAND)
+            self.assertEqual(injector.wayland_tool, "ydotool")
+
+    def test_wayland_wtype_fail_xdotool_when_uinput_blocked(self) -> None:
+        """ydotool in PATH without /dev/uinput still cannot rescue a wtype miss."""
+        with patch.dict(
+            "os.environ", {"XDG_SESSION_TYPE": "wayland", "SNAP": "/snap/vocalinux/x1"}
+        ):
+            self.mock_which.side_effect = lambda cmd: {
+                "wtype": "/usr/bin/wtype",
+                "ydotool": "/usr/bin/ydotool",
+                "xdotool": "/usr/bin/xdotool",
+            }.get(cmd)
+
+            mock_process = MagicMock()
+            mock_process.returncode = 1
+            mock_process.stderr = "compositor does not support virtual keyboard protocol"
+            self.mock_subprocess.return_value = mock_process
+
+            with patch.object(TextInjector, "_uinput_usable", return_value=False):
+                injector = TextInjector()
+
+            self.assertEqual(injector.environment, DesktopEnvironment.WAYLAND_XDOTOOL)
+
     def test_x11_text_injection(self):
         """Test text injection in X11 environment."""
         # Setup X11 environment
@@ -859,6 +900,155 @@ class TestTextInjector(unittest.TestCase):
         cmd = injector._ydotool_ctrl_v_command()
         self.assertEqual(cmd, ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
 
+    def _minimal_paste_injector(self) -> TextInjector:
+        injector = TextInjector.__new__(TextInjector)
+        injector._state_lock = threading.Lock()
+        injector._clipboard_restore_generation = 0
+        injector._clipboard_restore_target = None
+        injector.environment = DesktopEnvironment.WAYLAND
+        injector._session_environment = DesktopEnvironment.WAYLAND
+        injector.wayland_tool = "ydotool"
+        injector._wtype_paste_usable = False
+        return injector
+
+    def _inject_failing_paste(
+        self, injector: TextInjector, mock_run: MagicMock, paste_cmd: list, error: BaseException
+    ) -> bool:
+        def run_side_effect(cmd, **kwargs):
+            if cmd == paste_cmd:
+                raise error
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = run_side_effect
+        with patch.object(injector, "_copy_to_clipboard", return_value=True):
+            with patch.object(injector, "_read_clipboard", return_value=None):
+                with patch.object(injector, "_should_copy_to_clipboard", return_value=False):
+                    with patch.object(injector, "_should_use_terminal_paste", return_value=False):
+                        with patch.object(
+                            injector, "_clipboard_paste_command", return_value=paste_cmd
+                        ):
+                            return injector._inject_via_clipboard_paste("hello")
+
+    def test_ydotool_paste_release_command_lifts_held_keys(self):
+        """Release argv follows the actual paste chord, including Shift and layout 'v'."""
+        injector = TextInjector.__new__(TextInjector)
+        self.assertEqual(
+            injector._ydotool_paste_release_command(
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]
+            ),
+            ["ydotool", "key", "47:0", "29:0"],
+        )
+        self.assertEqual(
+            injector._ydotool_paste_release_command(
+                ["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
+            ),
+            ["ydotool", "key", "47:0", "42:0", "29:0"],
+        )
+        self.assertEqual(
+            injector._ydotool_paste_release_command(
+                ["ydotool", "key", "29:1", "17:1", "17:0", "29:0"]
+            ),
+            ["ydotool", "key", "17:0", "29:0"],
+        )
+        self.assertEqual(
+            injector._ydotool_paste_release_command(["ydotool", "key", "ctrl+v"]),
+            ["ydotool", "key", "ctrl"],
+        )
+        self.assertEqual(
+            injector._ydotool_paste_release_command(["ydotool", "key", "ctrl+shift+v"]),
+            ["ydotool", "key", "ctrl+shift"],
+        )
+        self.assertEqual(
+            injector._ydotool_paste_release_command(["wtype", "-M", "ctrl", "v"]),
+            [],
+        )
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    def test_ydotool_paste_timeout_releases_v1_modifiers(self, mock_run):
+        """Timeout mid Ctrl+V must send V-up and Ctrl-up (#658)."""
+        injector = self._minimal_paste_injector()
+        paste_cmd = ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]
+        result = self._inject_failing_paste(
+            injector, mock_run, paste_cmd, subprocess.TimeoutExpired(paste_cmd, 3)
+        )
+
+        self.assertFalse(result)
+        cmds = [c.args[0] for c in mock_run.call_args_list if c.args]
+        release_cmd = ["ydotool", "key", "47:0", "29:0"]
+        self.assertIn(release_cmd, cmds)
+        release_kwargs = next(
+            c.kwargs for c in mock_run.call_args_list if c.args and c.args[0] == release_cmd
+        )
+        self.assertIn("env", release_kwargs)
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    def test_ydotool_paste_timeout_releases_terminal_shift(self, mock_run):
+        """A timed-out Ctrl+Shift+V chord must also lift Shift (#658)."""
+        injector = self._minimal_paste_injector()
+        paste_cmd = ["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
+        result = self._inject_failing_paste(
+            injector, mock_run, paste_cmd, subprocess.TimeoutExpired(paste_cmd, 3)
+        )
+
+        self.assertFalse(result)
+        cmds = [c.args[0] for c in mock_run.call_args_list if c.args]
+        self.assertIn(["ydotool", "key", "47:0", "42:0", "29:0"], cmds)
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    def test_ydotool_paste_error_releases_legacy_ctrl(self, mock_run):
+        """A failed 0.1.x ctrl+v paste must tap ctrl so a stuck modifier can lift (#658)."""
+        injector = self._minimal_paste_injector()
+        paste_cmd = list(TextInjector._YDOTOOL_LEGACY_CTRL_V)
+        result = self._inject_failing_paste(
+            injector, mock_run, paste_cmd, subprocess.CalledProcessError(1, paste_cmd)
+        )
+
+        self.assertFalse(result)
+        cmds = [c.args[0] for c in mock_run.call_args_list if c.args]
+        self.assertIn(["ydotool", "key", "ctrl"], cmds)
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    def test_ydotool_paste_error_releases_legacy_ctrl_shift(self, mock_run):
+        """A failed 0.1.x ctrl+shift+v paste must tap ctrl+shift (#658)."""
+        injector = self._minimal_paste_injector()
+        paste_cmd = list(TextInjector._YDOTOOL_LEGACY_CTRL_SHIFT_V)
+        result = self._inject_failing_paste(
+            injector, mock_run, paste_cmd, subprocess.CalledProcessError(1, paste_cmd)
+        )
+
+        self.assertFalse(result)
+        cmds = [c.args[0] for c in mock_run.call_args_list if c.args]
+        self.assertIn(["ydotool", "key", "ctrl+shift"], cmds)
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    def test_ydotool_paste_release_timeout_still_returns_false(self, mock_run):
+        """A wedged daemon on the release path must not raise out of paste (#658)."""
+        injector = self._minimal_paste_injector()
+        paste_cmd = ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"]
+        mock_run.side_effect = subprocess.TimeoutExpired("ydotool", 3)
+        with patch.object(injector, "_copy_to_clipboard", return_value=True):
+            with patch.object(injector, "_read_clipboard", return_value=None):
+                with patch.object(injector, "_should_copy_to_clipboard", return_value=False):
+                    with patch.object(injector, "_should_use_terminal_paste", return_value=False):
+                        with patch.object(
+                            injector, "_clipboard_paste_command", return_value=paste_cmd
+                        ):
+                            result = injector._inject_via_clipboard_paste("hello")
+        self.assertFalse(result)
+
+    @patch("vocalinux.text_injection.text_injector.subprocess.run")
+    def test_wtype_paste_timeout_does_not_release_ydotool_keys(self, mock_run):
+        """wtype paste failure must not send a ydotool key-up (#658)."""
+        injector = self._minimal_paste_injector()
+        paste_cmd = ["wtype", "-M", "ctrl", "v"]
+        result = self._inject_failing_paste(
+            injector, mock_run, paste_cmd, subprocess.TimeoutExpired(paste_cmd, 3)
+        )
+
+        self.assertFalse(result)
+        cmds = [c.args[0] for c in mock_run.call_args_list if c.args]
+        self.assertFalse(any(isinstance(c, list) and c and c[0] == "ydotool" for c in cmds))
+
     @patch("vocalinux.text_injection.text_injector.shutil.which")
     @patch("vocalinux.text_injection.text_injector.subprocess.run")
     def test_clipboard_paste_returns_false_on_paste_failure(self, mock_run, mock_which):
@@ -1223,46 +1413,308 @@ class TestTextInjectorEdgeCases(unittest.TestCase):
     def test_inject_with_xdotool_xwayland_no_display(self):
         """Test xdotool injection in XWayland mode without DISPLAY set."""
         with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland"}, clear=False):
-            # Temporarily remove DISPLAY
             env_backup = os.environ.get("DISPLAY")
-            if "DISPLAY" in os.environ:
-                del os.environ["DISPLAY"]
+            os.environ.pop("DISPLAY", None)
 
             try:
 
                 def which_side_effect(cmd):
-                    if cmd in ["xdotool"]:
-                        return f"/usr/bin/{cmd}"
+                    if cmd == "xdotool":
+                        return "/usr/bin/xdotool"
                     return None
 
                 self.mock_which.side_effect = which_side_effect
+                self.mock_subprocess.return_value = MagicMock(
+                    returncode=0, stdout="12345", stderr=""
+                )
 
-                # Create injector in WAYLAND_XDOTOOL mode
-                injector = TextInjector.__new__(TextInjector)
-                injector._state_lock = threading.Lock()
+                injector = TextInjector()
                 injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
-
-                # Mock subprocess.run
-                mock_result = MagicMock()
-                mock_result.returncode = 0
-                mock_result.stdout = "12345"
-                mock_result.stderr = ""
-                self.mock_subprocess.return_value = mock_result
-
-                # Run injection - should set DISPLAY to :0
                 injector._inject_with_xdotool("test")
 
-                # Verify DISPLAY was set in the env passed to subprocess
-                calls = self.mock_subprocess.call_args_list
-                for call in calls:
-                    if "env" in call.kwargs:
-                        env = call.kwargs["env"]
-                        if "type" in str(call):
-                            self.assertEqual(env.get("DISPLAY"), ":0")
+                typed = [
+                    c
+                    for c in self.mock_subprocess.call_args_list
+                    if c.args and c.args[0][:2] == ["xdotool", "type"]
+                ]
+                self.assertTrue(typed, "should fall back to xdotool type without xclip")
+                self.assertEqual(typed[0].kwargs.get("env", {}).get("DISPLAY"), ":0")
             finally:
-                # Restore DISPLAY
                 if env_backup is not None:
                     os.environ["DISPLAY"] = env_backup
+                elif "DISPLAY" in os.environ:
+                    del os.environ["DISPLAY"]
+
+    def test_inject_with_xdotool_xwayland_prefers_x11_clipboard_paste(self) -> None:
+        """XWayland fallback must paste via xclip + xdotool ctrl+v, not `xdotool
+        type` (#657, and the 2026-08-17 review on PR #680).
+
+        `xdotool type` simulates keypresses against the active X keyboard
+        layout, so a character the layout doesn't map comes out as the wrong
+        glyph or garbled. The paste keystroke lands on an XWayland window,
+        which reads the X11 CLIPBOARD selection, so the copy step must use
+        xclip/xsel (not wl-copy) and the paste itself uses xdotool's own
+        `key ctrl+v` rather than ydotool: ydotool simulates Wayland-native
+        input, is not what an XWayland paste reads from, and per the reported
+        AppImage build is not even always installed.
+        """
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "xclip"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            with patch.object(injector, "_should_use_terminal_paste", return_value=False):
+                injector._inject_with_xdotool("привет")
+
+            calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+            self.assertTrue(
+                any(c[:2] == ["xclip", "-selection"] for c in calls),
+                "should copy text to the X11 CLIPBOARD selection via xclip",
+            )
+            xclip_copy_calls = [
+                c
+                for c in self.mock_subprocess.call_args_list
+                if c.args and c.args[0] == ["xclip", "-selection", "clipboard"]
+            ]
+            self.assertTrue(
+                xclip_copy_calls and xclip_copy_calls[0].kwargs.get("input") == "привет",
+                "the dictated text itself must be what xclip receives on stdin",
+            )
+            self.assertIn(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                calls,
+                "should paste with xdotool key --clearmodifiers ctrl+v",
+            )
+            self.assertFalse(
+                any(c[0] == "wl-copy" for c in calls),
+                "must not write to the Wayland-native clipboard; an XWayland paste cannot read it",
+            )
+            self.assertFalse(
+                any(c[0] == "ydotool" for c in calls),
+                "must not require ydotool when xclip/xsel are available",
+            )
+            self.assertFalse(
+                any(c[:2] == ["xdotool", "type"] for c in calls),
+                "must not fall back to layout-dependent xdotool type when paste succeeds",
+            )
+
+    def test_inject_with_xdotool_xwayland_types_when_x11_clipboard_missing(self) -> None:
+        """No xclip/xsel: type, even if ydotool/wl-copy exist.
+
+        ydotool+wl-copy writes the Wayland clipboard; an XWayland window
+        pastes the X11 CLIPBOARD. Treating ydotool rc=0 as success skips
+        type and leaves the wrong (or empty) selection in the field.
+        """
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "ydotool", "wl-copy"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="12345", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            injector._inject_with_xdotool("привет")
+
+            calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+            self.assertTrue(
+                any(c[:2] == ["xdotool", "type"] for c in calls),
+                "should fall back to xdotool type when xclip/xsel are missing",
+            )
+            self.assertFalse(
+                any(c[0] == "wl-copy" for c in calls),
+                "must not write the Wayland clipboard for an XWayland paste",
+            )
+            self.assertFalse(
+                any(c[:2] == ["ydotool", "key"] for c in calls),
+                "must not treat ydotool ctrl+v as an XWayland paste",
+            )
+
+    def test_inject_with_xdotool_xwayland_types_when_paste_fails(self) -> None:
+        """xclip copy works but xdotool key fails: fall through to type."""
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "xclip"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        def run_side_effect(cmd, **kwargs):
+            if cmd[:2] == ["xdotool", "key"]:
+                raise subprocess.CalledProcessError(1, cmd, stderr="paste failed")
+            return MagicMock(returncode=0, stdout="12345", stderr="")
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.side_effect = run_side_effect
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            with patch.object(injector, "_should_use_terminal_paste", return_value=False):
+                injector._inject_with_xdotool("привет")
+
+            calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+            self.assertTrue(
+                any(c[:2] == ["xdotool", "type"] for c in calls),
+                "should fall back to xdotool type when the paste chord fails",
+            )
+
+    def test_inject_with_xdotool_xwayland_paste_sets_display(self) -> None:
+        """xdotool key on the paste path gets DISPLAY=:0 when it was unset."""
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "xclip"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            env_backup = os.environ.get("DISPLAY")
+            os.environ.pop("DISPLAY", None)
+            try:
+                injector = TextInjector()
+                injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+                with patch.object(injector, "_should_use_terminal_paste", return_value=False):
+                    injector._inject_with_xdotool("привет")
+                key_calls = [
+                    c
+                    for c in self.mock_subprocess.call_args_list
+                    if c.args and c.args[0][:2] == ["xdotool", "key"]
+                ]
+                self.assertTrue(key_calls)
+                self.assertEqual(key_calls[0].kwargs.get("env", {}).get("DISPLAY"), ":0")
+            finally:
+                if env_backup is not None:
+                    os.environ["DISPLAY"] = env_backup
+                elif "DISPLAY" in os.environ:
+                    del os.environ["DISPLAY"]
+
+    def test_inject_with_xdotool_xwayland_falls_back_without_any_paste_tool(self) -> None:
+        """Neither xclip/xsel nor ydotool installed: keeps typing via xdotool."""
+
+        def which_side_effect(cmd):
+            if cmd == "xdotool":
+                return "/usr/bin/xdotool"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="12345", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+
+            injector._inject_with_xdotool("hello")
+
+            calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+            self.assertTrue(
+                any(c[:2] == ["xdotool", "type"] for c in calls),
+                "should fall back to xdotool type when no clipboard-paste tool exists",
+            )
+
+    def test_inject_text_appimage_scenario_recovers_through_xclip_paste(self) -> None:
+        """Reproduces the #657 report through inject_text(), not the fallback
+        method directly (2026-08-17 review on PR #680): AppImage packaging
+        does not bundle ydotool, so `_try_recover_from_fallback()` must find
+        `which("ydotool")` false and leave `environment` at WAYLAND_XDOTOOL,
+        and the xdotool fallback must then paste via xclip rather than type.
+        """
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "xclip"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="12345", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            with patch.object(injector, "_should_use_terminal_paste", return_value=False):
+                result = injector.inject_text("привет")
+
+            self.assertTrue(result)
+            self.assertEqual(
+                injector.environment,
+                DesktopEnvironment.WAYLAND_XDOTOOL,
+                "recovery has no ydotool to find, so it must not claim a switch to WAYLAND",
+            )
+            calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+            self.assertIn(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                calls,
+                "should paste via xdotool ctrl+v against the X11 clipboard xclip wrote",
+            )
+            self.assertFalse(
+                any(c[:2] == ["xdotool", "type"] for c in calls),
+                "must not fall through to the layout-dependent type path when the paste succeeds",
+            )
+
+    def test_inject_with_xdotool_xwayland_uses_terminal_paste_chord(self) -> None:
+        """XWayland xclip paste must still use Ctrl+Shift+V in terminals (#734)."""
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "xclip"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            with patch.object(injector, "_should_use_terminal_paste", return_value=True):
+                injector._inject_with_xdotool("ls")
+
+            calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+            self.assertIn(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
+                calls,
+                "terminals must get Ctrl+Shift+V from the XWayland xdotool paste path",
+            )
+            self.assertNotIn(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                calls,
+            )
+            self.assertFalse(
+                any(c[:2] == ["xdotool", "type"] for c in calls),
+                "must not fall back to xdotool type when the terminal paste succeeds",
+            )
+
+    def test_copy_to_clipboard_setting_still_prefers_wl_copy_on_xwayland(self) -> None:
+        """User-facing copy keeps the session clipboard; only paste is X11-only."""
+
+        def which_side_effect(cmd):
+            if cmd in ("xdotool", "xclip", "wl-copy"):
+                return f"/usr/bin/{cmd}"
+            return None
+
+        self.mock_which.side_effect = which_side_effect
+        self.mock_subprocess.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "w-1"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+            injector._copy_to_clipboard("hello")
+
+        calls = [c.args[0] for c in self.mock_subprocess.call_args_list if c.args]
+        self.assertTrue(
+            any(c[0] == "wl-copy" for c in calls),
+            "copy_to_clipboard setting should still prefer wl-copy on a Wayland host",
+        )
 
     def test_inject_with_xdotool_releases_modifiers_without_escape(self):
         """The xdotool path must keep the target input focused after injection."""
@@ -2210,24 +2662,38 @@ class TestCompositorIBusBridging(unittest.TestCase):
         self.assertFalse(injector._is_ydotoold_running())
 
     @patch("vocalinux.text_injection.text_injector.shutil.which")
-    def test_ensure_ydotoold_ready_when_only_ydotool_cli(self, mock_which):
+    def test_ensure_ydotoold_ready_when_only_ydotool_cli(self, mock_which: MagicMock) -> None:
         """Host ydotool 0.1.x without ydotoold is still considered ready."""
         mock_which.side_effect = lambda cmd: "/usr/bin/ydotool" if cmd == "ydotool" else None
         injector = self._bare_injector()
         with patch.object(injector, "_is_ydotoold_running", return_value=False):
-            self.assertTrue(injector._ensure_ydotoold())
+            with patch.object(injector, "_uinput_usable", return_value=True):
+                self.assertTrue(injector._ensure_ydotoold())
 
-    @patch("os.path.exists", return_value=False)
+    @patch("vocalinux.text_injection.text_injector.shutil.which")
+    def test_ensure_ydotoold_false_when_uinput_not_writable(self, mock_which: MagicMock) -> None:
+        """0.1.x ydotool without /dev/uinput write access is not ready (Snap)."""
+        mock_which.side_effect = lambda cmd: "/usr/bin/ydotool" if cmd == "ydotool" else None
+        injector = self._bare_injector()
+        with patch.object(injector, "_is_ydotoold_running", return_value=False):
+            with patch.object(injector, "_uinput_usable", return_value=False):
+                self.assertFalse(injector._ensure_ydotoold())
+
+    @patch.object(TextInjector, "_uinput_usable", return_value=False)
     @patch("vocalinux.text_injection.text_injector.shutil.which", return_value="/app/bin/ydotoold")
-    def test_ensure_ydotoold_false_without_uinput(self, _mock_which, _mock_exists):
+    def test_ensure_ydotoold_false_without_uinput(
+        self, _mock_which: MagicMock, _mock_uinput: MagicMock
+    ) -> None:
         injector = self._bare_injector()
         with patch.object(injector, "_is_ydotoold_running", return_value=False):
             self.assertFalse(injector._ensure_ydotoold())
 
+    @patch.object(TextInjector, "_uinput_usable", return_value=True)
     @patch("vocalinux.text_injection.text_injector.subprocess.Popen")
-    @patch("os.path.exists", return_value=True)
     @patch("vocalinux.text_injection.text_injector.shutil.which", return_value="/app/bin/ydotoold")
-    def test_ensure_ydotoold_starts_daemon(self, _mock_which, _mock_exists, mock_popen):
+    def test_ensure_ydotoold_starts_daemon(
+        self, _mock_which: MagicMock, mock_popen: MagicMock, _mock_uinput: MagicMock
+    ) -> None:
         injector = self._bare_injector()
         # First probe: not running; after start: running
         with patch.object(injector, "_is_ydotoold_running", side_effect=[False, False, True]):

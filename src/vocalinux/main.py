@@ -82,7 +82,7 @@ def parse_arguments():
     parser.add_argument(
         "--engine",
         type=str,
-        choices=["vosk", "whisper", "whisper_cpp", "parakeet", "remote_api"],
+        choices=["vosk", "whisper", "whisper_cpp", "parakeet", "faster_whisper", "remote_api"],
         help="Speech recognition engine to use (whisper_cpp recommended for best performance)",
     )
     parser.add_argument("--wayland", action="store_true", help="Force Wayland compatibility mode")
@@ -308,6 +308,10 @@ def main():
     # Check if display is available before creating any GTK widgets
     if not check_display_available():
         sys.exit(1)
+
+    from .utils.gtk_color_scheme import apply_os_color_scheme
+
+    apply_os_color_scheme()
 
     if not check_appindicator_support():
         logger.warning("No StatusNotifierWatcher found on D-Bus session bus.")

@@ -343,10 +343,12 @@ def test_no_second_toplevel_is_created_for_advanced(settings_dialog, dialog_clas
     import inspect
 
     source = inspect.getsource(dialog_class._build_simple_model_section)
+    helper = inspect.getsource(settings_dialog._make_expander_card)
 
     assert "Gtk.Window(" not in source
     assert "set_transient_for" not in source
-    assert "Gtk.Expander" in source
+    assert "_make_expander_card" in source
+    assert "Gtk.Expander" in helper
 
 
 def test_opening_simple_mode_describes_the_current_model_instead_of_resetting_it(
@@ -536,6 +538,7 @@ def test_changing_advanced_language_refreshes_the_simple_readout(settings_dialog
     dialog._processing_language_change = False
     dialog._initializing = False
     dialog._applying_settings = False
+    dialog._simple_driving = False
     dialog.language_combo.get_active_id.return_value = "pl"
     dialog.engine_combo.get_active_text.return_value = "Local (whisper.cpp)"
 

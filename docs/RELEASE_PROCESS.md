@@ -49,7 +49,8 @@ Use this checklist for every release:
 - [ ] `pyproject.toml` - Confirm `Development Status` classifier and `requires-python` are correct for this release phase
 
 ### Documentation
-- [ ] `README.md` - Update release announcement and status references
+- [ ] `README.md` - Update short current-release blurb (not full notes)
+- [ ] `CHANGELOG.md` - Point "Current stable" at the new tag
 - [ ] `docs/INSTALL.md` - Verify install examples use `main/install.sh` (not version-pinned raw URLs)
 - [ ] `docs/UPDATE.md` - Add "What's New" section for new version
 - [ ] `SECURITY.md` - Update supported versions table
@@ -87,7 +88,9 @@ Install `just` from https://just.systems or the distro package `just`.
 
 `verify-release.yml` runs the same check when the release workflow finishes.
 It cannot see a hand edit made afterwards, which is how every v0.16.2 defect
-arrived, so run it yourself after touching a published release.
+arrived, so run it yourself after touching a published release. The one
+exception is `snap-backfill.yml`: that workflow attaches the snap, rewrites
+`SHA256SUMS`, and then runs `scripts/verify_release.py` itself.
 
 ## Detailed Release Steps
 
@@ -153,19 +156,20 @@ Use these rules for every GitHub Release body (and for the draft pasted into the
 #### Sources of truth
 
 - Delta commits: `git log vPREV..HEAD` plus merged PR titles/bodies.
-- Closed issues via PR `Fixes` / `Closes` references only — do not invent issue numbers.
+- Closed issues via PR `Fixes` / `Closes` references only - do not invent issue numbers.
 - Do not invent benchmarks, user counts, testimonials, or features not in the tree.
 
 #### Required structure
 
 1. `# Vocalinux vX.Y.Z` title
 2. One to three plain sentences: what this release is for (no hype)
-3. `## Highlights` — markdown table, about 4–8 rows
-4. `## New Features` — bullets with PR + author; include issue closes when real
-5. `## Bug Fixes` — group by area (IBus, Installer, AUR, Text injection, …)
+3. `## Highlights` - markdown table, about 4-8 rows
+4. `## New Features` - bullets with PR + author; include issue closes when real
+5. `## Bug Fixes` - group by area (IBus, Installer, AUR, Text injection, …)
 6. Optional: `## Improvements`, `## Docs`, `## Packaging`
-7. `## Thanks` — external PR authors and issue reporters by `@handle`
-8. `## Install / Upgrade` — `install.sh`, AUR, PyPI, **AppImage**, Flatpak status (honest)
+7. `## Thanks` - external PR authors and issue reporters by `@handle`
+8. `## Install / Upgrade` - `install.sh`, AUR, PyPI, **AppImage**, Flatpak, Snap
+   (Store channels plus GitHub `.snap` sideload when Store review is pending)
 9. `### Verifying what you downloaded` (required, and easy to lose). `release.yml`
    generates it, with `sha256sum -c --ignore-missing SHA256SUMS` and
    `gh attestation verify`. A hand-written body replaces the generated one, so carry
@@ -176,7 +180,7 @@ Use these rules for every GitHub Release body (and for the draft pasted into the
 #### Include / exclude
 
 - **Include:** user-visible features, install/packaging changes, desktop reliability fixes, docs that change user instructions.
-- **Exclude or demote:** Dependabot-only bumps, CI matrix tweaks, agent-env docs, pure refactors — short “CI / maintenance” subsection at most.
+- **Exclude or demote:** Dependabot-only bumps, CI matrix tweaks, agent-env docs, pure refactors - short “CI / maintenance” subsection at most.
 
 #### Attribution and voice
 
@@ -186,7 +190,7 @@ Use these rules for every GitHub Release body (and for the draft pasted into the
 
 #### Website changelog vs GitHub Release
 
-- **Website** (`web/src/app/changelog/page.tsx`): 3–10 concise user-facing bullets for the new entry.
+- **Website** (`web/src/app/changelog/page.tsx`): 3-10 concise user-facing bullets for the new entry.
 - **GitHub Release**: fuller narrative + install block + thanks. Draft in the release-prep **PR body**; paste/edit onto the release after the tag workflow runs (workflow install stub + generated notes are a starting point only).
 
 #### Minor vs patch (reminder)
@@ -203,30 +207,14 @@ Use these rules for every GitHub Release body (and for the draft pasted into the
 
 #### 3.1 Update `README.md`
 
-**Status Badge (line ~6):**
-```markdown
-<!-- Alpha -->
-[![Status: Alpha](https://img.shields.io/badge/Status-Alpha-orange)]
+**README current-release blurb:**
+Keep a short one-line pointer to the new tag and [docs/UPDATE.md](UPDATE.md). Do not paste the full release notes into the README.
 
-<!-- Beta -->
-[![Status: Beta](https://img.shields.io/badge/Status-Beta-blue)]
-
-<!-- Stable -->
-[![Status: Stable](https://img.shields.io/badge/Status-Stable-brightgreen)]
-```
-
-**Install Commands:**
-Keep install commands on `main/install.sh` (installer resolves latest release tag automatically):
+**Install commands:**
+Keep install examples on `main/install.sh` (download-then-run preferred; installer resolves latest release tag):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/main/install.sh | bash
-```
-
-**Release Announcement (lines ~31-34):**
-```markdown
-> 🎉 **Beta Release!**
->
-> We're excited to share Vocalinux Beta with the community.
-> This release is feature-complete and ready for broader testing.
+curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/main/install.sh -o /tmp/vl.sh
+bash /tmp/vl.sh
 ```
 
 #### 3.2 Update `docs/INSTALL.md`
@@ -390,26 +378,33 @@ git push origin v0.5.0-beta
 
 After pushing the tag, the GitHub Actions workflow will automatically:
 
-1. Build the Python package (wheel and sdist) — **once**, with `SOURCE_DATE_EPOCH`
+1. Build the Python package (wheel and sdist) - **once**, with `SOURCE_DATE_EPOCH`
    pinned to the tagged commit. Every later job downloads that artifact instead of
    rebuilding, so the wheel on PyPI is byte-for-byte the wheel on the release
 2. Build and attach AppImages for x86_64 and aarch64, both from that same wheel
 3. Create a GitHub Release with auto-generated notes
-4. Attach `SHA256SUMS` covering all four artifacts, and generate build provenance
-   attestations from that manifest (runs after the aarch64 AppImage lands, so a
-   partial manifest never gets published)
+4. Attach `SHA256SUMS` covering every GitHub asset (wheel, sdist, both AppImages,
+   both Flatpaks, the amd64 snap) and generate build provenance from that
+   manifest (runs after the aarch64 AppImage, both Flatpaks, and the snap land,
+   so a partial manifest never gets published)
 5. Publish to PyPI via trusted publishing
 6. Publish the AUR package (when the `AUR_SSH_PRIVATE_KEY` secret is configured)
 7. Deploy the website to vocalinux.com
-8. Mark as pre-release if version contains alpha/beta/rc
+8. Build the amd64 snap, attach it to the GitHub Release, and try Snap Store
+   `edge`/`candidate`. Store human review (for example `uinput` allow-installation)
+   must not block the GitHub `.snap`. `stable` is still a manual promote
+9. Mark as pre-release if version contains alpha/beta/rc
 
 Monitor at: https://github.com/VocaHQ/vocalinux/actions
 
 ### Step 9: Post-Release Tasks
 
 - [ ] Verify GitHub Release was created correctly
-- [ ] Verify `SHA256SUMS` is attached and lists all four artifacts (wheel, sdist,
-      both AppImages) — the release notes tell users to run `sha256sum -c` against it
+- [ ] Verify `SHA256SUMS` is attached and lists every GitHub asset (wheel, sdist,
+      both AppImages, both Flatpaks, the amd64 snap) - the release notes tell
+      users to run `sha256sum -c` against it
+- [ ] If the Store held the snap for `uinput` review, confirm the GitHub `.snap`
+      is still attached and the notes document `snap install --dangerous`
 - [ ] Verify provenance: `gh attestation verify <artifact> --repo VocaHQ/vocalinux`
 - [ ] Verify PyPI package was published (if applicable), and that its wheel sha256
       matches the line for that wheel in `SHA256SUMS`
@@ -463,6 +458,7 @@ git push origin v0.5.1-beta
 | 0.14.2 | 2026-07-17 | Stable | IBus engine launch + FocusIn gate; settings tabs scroll to fit monitor |
 | 0.15.0 | 2026-07-28 | Stable | Searchable settings + sidebar dictation footer, AppImage, expanded languages, dictation polish, auto-pause/keepalive, Vulkan device selection, ibus-wayland, Bluetooth mic + shortcut UI fixes |
 | 0.16.0 | 2026-08-23 | Stable | Update checker + tray notify, Right Alt PTT default (new installs), searchable language list, delete unused models, Voca tone picker (family preview WAVs), About page, AGPL-3.0, family mic icons, installer/just/uv pinning, Test Dictation missing-model message, IBus/audio/clipboard/GPU/AppImage reliability, vocalinux.com family workbench restyle |
+| 0.17.0 | 2026-09-16 | Stable | Faster Whisper + Parakeet engines, Speech Model simple setup, first-run system language, Snap with ydotool/uinput, Flatpak bundles on the GitHub Release, XWayland/layout paste and settings/audio fixes |
 | 0.16.2 | 2026-09-05 | Stable | Patch: KDE leftover IBus skip, Wayland/IBus shortcuts via wtype/ydotool, BackSpace delete that, installer glslc on Fedora/Arch, nightly version stamp, release integrity pins, AUR PKGBUILD CI gate, distro CI/docs drift, Gateway Beta on site |
 | 0.16.1 | 2026-08-30 | Stable | Patch: per-engine model at startup, leftover tray idle, terminal Ctrl+Shift+V paste, GNOME XWayland layout after IBus, Python 3.11 floor + verified downloads, AppImage glibc that boots on Debian 12, Settings/About polish |
 

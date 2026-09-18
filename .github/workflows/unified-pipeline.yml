@@ -51,6 +51,10 @@ jobs:
               - 'vocalinux.desktop'
               - 'resources/**'
               - 'justfile'
+              # scripts/ is guarded by tests/ and one of them is executed by the
+              # lint job: a scripts-only change that skipped this filter would
+              # skip both the checker and the tests that validate it.
+              - 'scripts/**'
               - '.pre-commit-config.yaml'
               - '.github/workflows/unified-pipeline.yml'
             # The AUR gate builds packaging/aur/vocalinux/PKGBUILD from this
@@ -91,7 +95,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
@@ -111,6 +115,15 @@ jobs:
         run: |
           uv run --locked --only-group lint isort --check-only --diff --profile black src/ tests/
 
+      # --locked above fails when uv.lock drifts from pyproject.toml; nothing
+      # covered the step after that one. The exports are hash-pinned copies of
+      # the lock written by `just lock`, and no workflow ever re-ran it, so one
+      # could sit behind the lock indefinitely. `uv export` reads the lock and
+      # nothing else, so this needs neither the network nor the system headers
+      # the test matrix installs, which is why it rides here.
+      - name: Exports match uv.lock
+        run: python3 scripts/check_exports.py
+
   python-test:
     name: 🧪 Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
@@ -128,7 +141,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
@@ -194,7 +207,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           # Caches uv's download cache, not .venv/, so the checkout below stays
           # the fresh clone this job exists to exercise.

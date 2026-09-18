@@ -1,7 +1,7 @@
 # Vocalinux Snap packaging
 #
 # First ship: strict confinement, default whisper.cpp engine path, GTK tray UI,
-# mic capture, model download, and X11/XWayland text injection (xdotool/xsel).
+# mic capture, model download, and text injection (ydotool/uinput, wtype, xdotool).
 # Informed by issue #48 and packaging/flatpak lessons on feat/flatpak-packaging.
 #
 # Build (from repo root, with snapcraft + LXD or Multipass):
@@ -12,7 +12,7 @@ name: vocalinux
 base: core24  # Ubuntu 24.04 / Python 3.12 (project requires-python >=3.11)
 # Fallback version; live version is set from src/vocalinux/version.py via
 # adopt-info + craftctl set in the vocalinux part (required for craftctl).
-version: "0.16.2"
+version: "0.17.0"
 adopt-info: vocalinux
 summary: Free offline voice dictation for Linux
 description: |
@@ -26,10 +26,12 @@ description: |
     - System tray control and GTK settings
     - Offline dictation (models download on first use)
     - Microphone capture and short feedback tones
-    - Text injection via xdotool/xsel (X11/XWayland) and IBus when available
+    - Text injection via ydotool (native Wayland/X11), wtype, or xdotool
 
   Sandbox notes:
     - Global hotkeys need: sudo snap connect vocalinux:raw-input
+    - Native Wayland typing needs: sudo snap connect vocalinux:uinput
+      (v0.17.0 ships the plug; v0.16.2 edge (rev 7) has no uinput plug; refresh first)
     - Microphone may need: sudo snap connect vocalinux:audio-record
     - Config and models live under ~/snap/vocalinux/
 
@@ -59,6 +61,10 @@ apps:
       # Super-privileged: not auto-connected; user must:
       #   sudo snap connect vocalinux:raw-input
       - raw-input
+      # ydotool writes to /dev/uinput so dictation reaches native Wayland apps.
+      # Super-privileged: not auto-connected; user must:
+      #   sudo snap connect vocalinux:uinput
+      - uinput
     common-id: com.vocalinux.Vocalinux
     desktop: usr/share/applications/vocalinux.desktop
     environment:
@@ -68,6 +74,15 @@ apps:
       PATH: $SNAP/usr/bin:$SNAP/bin:$PATH
       # PortAudio opens ALSA first. Point at snap-local config that routes to Pulse.
       ALSA_CONFIG_PATH: $SNAP/etc/asound.conf
+      # core24 gnome-46-2404: desktop-launch rebuilds gdk-pixbuf-loaders.cache
+      # by running query-loaders, which picks the SVG loader from the first
+      # LD_LIBRARY_PATH entry ending in /$CRAFT_ARCH_TRIPLET. Stage-packages
+      # (via libavcodec and friends) put a gdk-pixbuf tree without
+      # libpixbufloader_svg.so at $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET, ahead of
+      # gnome-platform. About page and other GdkPixbuf SVG loads then fail
+      # with "Image type svg is not supported".
+      # https://forum.snapcraft.io/t/missing-svg-support-for-gtk3-in-core24/48851
+      LD_LIBRARY_PATH: $SNAP/gnome-platform/usr/lib/$CRAFT_ARCH_TRIPLET:$LD_LIBRARY_PATH
 
 # Make ALSA data/plugins visible at the paths libasound expects.
 layout:
@@ -102,7 +117,9 @@ parts:
       - libasound2-plugins # pcm/ctl pulse → host PulseAudio/PipeWire
       - pulseaudio-utils # paplay for start/stop UI sounds
       - xdotool
-      - wtype # native Wayland text injection (preferred over xdotool)
+      - wtype # virtual-keyboard protocol (GNOME often rejects this)
+      - ydotool # uinput; reaches native Wayland apps (needs vocalinux:uinput)
+      - x11-utils # xprop for XWayland WM_CLASS
       - xsel
       - xclip
       - wl-clipboard

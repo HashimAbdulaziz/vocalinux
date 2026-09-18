@@ -365,7 +365,7 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --interactive, -i  Force interactive mode (default)"
             echo "  --auto           Non-interactive automatic installation"
-            echo "  --engine=NAME    Speech engine: whisper_cpp (default), whisper, vosk, parakeet, remote_api"
+            echo "  --engine=NAME    Speech engine: whisper_cpp (default), whisper, vosk, parakeet, faster_whisper, remote_api"
             echo "  --dev            Install in development mode with all dev dependencies"
             echo "  --test           Run tests after installation"
             echo "  --venv-dir=PATH  Specify custom virtual environment directory"
@@ -381,6 +381,7 @@ while [[ $# -gt 0 ]]; do
             echo "  $0                           # Interactive mode (recommended)"
             echo "  $0 --auto                    # Auto-install with whisper.cpp"
             echo "  $0 --auto --engine=vosk      # Auto-install VOSK only"
+            echo "  $0 --auto --engine=faster_whisper  # Auto-install faster-whisper"
             echo "  $0 --dev --test              # Dev mode with tests"
             echo ""
             echo "During installation a full transcript is saved to"
@@ -1073,22 +1074,30 @@ detect_whispercpp_backends() {
         VULKAN_COMPAT_REASON="NVIDIA GPU uses CUDA"
     fi
 
-    # Determine recommendation (Priority: CUDA > Vulkan > CPU)
-    # IMPORTANT: The installer WILL install dev libraries (libvulkan-dev, glslc, CUDA) later,
-    # so we recommend GPU if there's a compatible GPU regardless of current library status.
+    # Determine recommendation (Priority: Vulkan > CUDA fallback > CPU).
+    # install_whispercpp_with_gpu_support tries Vulkan first on every GPU,
+    # including NVIDIA. CUDA is used only when Vulkan is unavailable or the
+    # Vulkan build fails, and only if a complete toolkit is already present.
+    # The installer never installs the CUDA toolkit.
+    # IMPORTANT: Vulkan *dev* libraries (libvulkan-dev, glslc) are installed
+    # later, so we recommend GPU when a compatible GPU is present even if
+    # those packages are not installed yet.
     local RECOMMENDED_BACKEND="cpu"
     local RECOMMENDED_REASON=""
     local CAN_BUILD_GPU=false
 
-    # NVIDIA GPU - best option, uses CUDA
     if [[ "$HAS_NVIDIA_GPU" == "yes" ]]; then
-        RECOMMENDED_BACKEND="cuda"
-        if [[ "$HAS_CUDA_DEV" == "true" ]]; then
+        CAN_BUILD_GPU=true
+        if [[ "$HAS_VULKAN" == "yes" ]]; then
+            RECOMMENDED_BACKEND="vulkan"
+            RECOMMENDED_REASON="NVIDIA GPU detected (Vulkan)"
+        elif [[ "$HAS_CUDA_DEV" == "true" ]]; then
+            RECOMMENDED_BACKEND="cuda"
             RECOMMENDED_REASON="NVIDIA GPU with CUDA toolkit installed"
         else
-            RECOMMENDED_REASON="NVIDIA GPU detected (CUDA toolkit will be installed)"
+            RECOMMENDED_BACKEND="vulkan"
+            RECOMMENDED_REASON="NVIDIA GPU detected"
         fi
-        CAN_BUILD_GPU=true
     # Vulkan-compatible GPU (AMD, Intel Gen8+) - second choice
     elif [[ "$HAS_VULKAN" == "yes" && "$VULKAN_COMPATIBLE" == "compatible" ]]; then
         RECOMMENDED_BACKEND="vulkan"
@@ -1250,14 +1259,21 @@ EOF
     echo "  │     • Good for basic dictation needs                        │"
     echo "  └─────────────────────────────────────────────────────────────┘"
     echo ""
-    echo "  ┌───────────────────────────────────────────────────────────────┐"
-    echo "  │  4. REMOTE API (ADVANCED)                                     │"
-    echo "  │     • Offload processing to a GPU server on your network      │"
-    echo "  │     • Ideal for laptops without GPU                           │"
-    echo "  │     • Supports whisper.cpp server & OpenAI-compatible APIs    │"
-    echo "  │     • Minimal local resources needed                          │"
-    echo "  │     • Requires a remote server to be running                  │"
-    echo "  └───────────────────────────────────────────────────────────────┘"
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │  4. FASTER-WHISPER                                          │"
+    echo "  │     • Optional CTranslate2 Whisper backend                  │"
+    echo "  │     • Fast on CPU with INT8 quantization                    │"
+    echo "  │     • Checksum-verified Hugging Face models                 │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │  5. REMOTE API (ADVANCED)                                   │"
+    echo "  │     • Offload processing to a GPU server on your network    │"
+    echo "  │     • Ideal for laptops without GPU                         │"
+    echo "  │     • Supports whisper.cpp server & OpenAI-compatible APIs  │"
+    echo "  │     • Minimal local resources needed                        │"
+    echo "  │     • Requires a remote server to be running                │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
     echo ""
 
     # Show recommendation
@@ -1277,7 +1293,7 @@ EOF
     esac
     echo ""
 
-    read -p "Choose engine [1-4] (default: $DEFAULT_CHOICE): " ENGINE_CHOICE
+    read -p "Choose engine [1-5] (default: $DEFAULT_CHOICE): " ENGINE_CHOICE
     ENGINE_CHOICE=${ENGINE_CHOICE:-$DEFAULT_CHOICE}
 
     case "$ENGINE_CHOICE" in
@@ -1294,6 +1310,10 @@ EOF
             ENGINE_DISPLAY="VOSK (Lightweight)"
             ;;
         4)
+            SELECTED_ENGINE="faster_whisper"
+            ENGINE_DISPLAY="Faster-Whisper"
+            ;;
+        5)
             SELECTED_ENGINE="remote_api"
             ENGINE_DISPLAY="Remote API"
             ;;
@@ -1345,7 +1365,7 @@ EOF
             echo "  ┌─────────────────────────────────────────────────────────────┐"
             echo "  │  1. GPU (Vulkan/CUDA)  * RECOMMENDED                        │"
             echo "  │     • Fastest performance with GPU acceleration             │"
-            echo "  │     • $RECOMMENDED_REASON                                   │"
+            printf "  │     • %-*s│\n" 54 "$RECOMMENDED_REASON"
             echo "  │     • Requires building from source (takes ~2-5 min)        │"
             echo "  └─────────────────────────────────────────────────────────────┘"
             echo ""
@@ -1547,12 +1567,11 @@ fi
 
 # Set default engine for auto/non-interactive mode
 if [[ "$NON_INTERACTIVE" == "yes" ]] && [[ -z "$SELECTED_ENGINE" ]]; then
-    # Default to whisper.cpp for best performance
     SELECTED_ENGINE="whisper_cpp"
     print_info "Automatic mode: Installing with whisper.cpp (default engine)"
-    print_info "For other engines, use: --engine=whisper or --engine=vosk or --engine=remote_api"
-    echo ""
+    print_info "For other engines, use: --engine=whisper, --engine=vosk, --engine=parakeet, --engine=faster_whisper, or --engine=remote_api"
 fi
+
 
 # Function to check if a command exists
 command_exists() {
@@ -1750,7 +1769,17 @@ install_system_dependencies() {
     local APT_PACKAGES_DEBIAN_13_PLUS="$APT_PACKAGES_DEBIAN_BASE libgirepository-2.0-dev gir1.2-ayatanaappindicator3-0.1"
     local DNF_PACKAGES="python3-pip python3-gobject gtk3 ibus-devel gobject-introspection-devel python3-devel portaudio-devel python3-virtualenv pkg-config cmake wget curl unzip vulkan-tools vulkan-loader-devel glslc patchelf xclip xsel wl-clipboard"
     local PACMAN_PACKAGES="python-pip python-gobject gtk3 ibus gobject-introspection python-cairo portaudio python-virtualenv pkg-config cmake wget curl unzip base-devel vulkan-tools vulkan-headers shaderc patchelf xclip xsel wl-clipboard"
-    local ZYPPER_PACKAGES="gtk3 ibus-devel gobject-introspection-devel portaudio-devel pkg-config cmake wget curl unzip xclip xsel wl-clipboard typelib-1_0-Notify-0_7 libnotify4 patchelf"
+    # ibus + typelib-1_0-IBus-1_0, not ibus-devel: the headers are not needed
+    # (IBus is reached through GI at runtime), and requiring them pulls gtk-doc,
+    # which zypper cannot satisfy when awk resolves to busybox-gawk. The runtime
+    # package is needed: ibus_engine.py spawns `ibus-daemon -x -d -r` and shells
+    # out to `ibus engine`, and ibus-devel used to pull it in transitively
+    # (Requires: ibus = %version). The typelib is named as well as implied by
+    # ibus's own typelib(IBus) require, so the GI dependency stays visible here.
+    # gcc/gcc-c++/make: the counterpart of build-essential and base-devel above.
+    # python3-devel supplies headers, not a compiler, and evdev and pyaudio ship
+    # no wheels, so without these they have nothing to build with.
+    local ZYPPER_PACKAGES="gtk3 ibus typelib-1_0-IBus-1_0 gobject-introspection-devel portaudio-devel pkg-config cmake gcc gcc-c++ make wget curl unzip xclip xsel wl-clipboard typelib-1_0-Notify-0_7 libnotify4 patchelf"
     # Gentoo uses Portage and different package naming convention
     local EMERGE_PACKAGES="dev-python/pygobject:3 x11-libs/gtk+:3 dev-libs/libayatana-appindicator media-libs/portaudio dev-lang/python:3.11 pkgconf cmake media-libs/shaderc dev-util/patchelf x11-misc/xclip x11-misc/xsel gui-apps/wl-clipboard"
     # Alpine Linux uses apk and has musl libc
@@ -2914,6 +2943,7 @@ engine_import_module() {
         whisper) echo "whisper" ;;
         whisper_cpp) echo "pywhispercpp.model" ;;
         parakeet) echo "sherpa_onnx" ;;
+        faster_whisper) echo "faster_whisper" ;;
         *) echo "" ;;
     esac
 }
@@ -2924,6 +2954,7 @@ engine_pip_name() {
         whisper) echo "openai-whisper" ;;
         whisper_cpp) echo "pywhispercpp" ;;
         parakeet) echo "sherpa-onnx" ;;
+        faster_whisper) echo "faster-whisper" ;;
         *) echo "" ;;
     esac
 }
@@ -3609,6 +3640,35 @@ REMOTE_CONFIG
                     print_success "Remote API configured with server: $REMOTE_API_URL"
                 else
                     print_warning "No server URL configured. You can set it later in Settings."
+                fi
+                ;;
+
+            faster_whisper)
+                print_info "Installing Faster-Whisper engine..."
+                print_info "This engine uses CTranslate2 for fast CPU inference."
+
+                if pip_install_extras_skip_pygobject "$PIP_LOG_FILE" faster_whisper; then
+                    mkdir -p "$CONFIG_DIR"
+                    if [ ! -f "$CONFIG_DIR/config.json" ]; then
+                        cat > "$CONFIG_DIR/config.json" << 'FASTER_WHISPER_CONFIG'
+{
+    "shortcuts": {
+        "toggle_recognition": "right_alt+right_alt",
+        "mode": "push_to_talk"
+    }
+}
+FASTER_WHISPER_CONFIG
+                    fi
+                    set_configured_engine "$CONFIG_DIR/config.json" faster_whisper ||
+                        print_warning "Could not point $CONFIG_DIR/config.json at the faster_whisper engine."
+                else
+                    print_error "Failed to install the faster-whisper engine"
+                    print_error "Falling back to whisper.cpp (recommended engine)"
+                    install_cpu_pywhispercpp "$PIP_LOG_FILE" || {
+                        print_error "Failed to install whisper.cpp fallback"
+                        return 1
+                    }
+                    SELECTED_ENGINE="whisper_cpp"
                 fi
                 ;;
         esac
@@ -4573,6 +4633,20 @@ verify_installation() {
         fi
     fi
 
+    if [[ "$selected_engine" == "faster_whisper" ]]; then
+        if ! "$VENV_DIR/bin/python" -c "import faster_whisper" 2>/dev/null; then
+            print_error "faster-whisper package installed but cannot be imported at runtime."
+            print_error ""
+            print_error "Diagnostic steps:"
+            print_error "  1. Check pip installation: $VENV_DIR/bin/pip show faster-whisper"
+            print_error "  2. Re-run the installer with: --engine=faster_whisper"
+            print_error "  3. Or switch to whisper.cpp: --engine=whisper_cpp"
+            ISSUES=$((ISSUES + 1))
+        else
+            print_success "faster-whisper import verified successfully."
+        fi
+    fi
+
     # Return the number of issues found
     return $ISSUES
 }
@@ -4626,6 +4700,10 @@ EOF
         parakeet)
             ENGINE_DISPLAY_NAME="Parakeet"
             BACKEND_INFO="CPU"
+            ;;
+        faster_whisper)
+            ENGINE_DISPLAY_NAME="Faster-Whisper"
+            BACKEND_INFO="PyTorch/CTranslate2"
             ;;
         remote_api)
             ENGINE_DISPLAY_NAME="Remote API"

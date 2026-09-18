@@ -17,10 +17,14 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    import numpy as np
 
 from ..common_types import RecognitionState
 from ..ui.audio_feedback import play_error_sound, play_start_sound, play_stop_sound
+from ..utils import faster_whisper_model_info as faster_whisper
 from ..utils import parakeet_model_info as parakeet
 from ..utils.host_process import host_env
 from ..utils.model_checksums import (
@@ -517,10 +521,10 @@ def _open_capture_stream(audio, device_index: Optional[int] = None) -> tuple[int
     heap corruption (see GitHub issue #567).
 
     This function opens PortAudio exactly once per capture session: candidate
-    formats are tried in order (device default rate first, mono before stereo,
-    stereo skipped entirely for mono-only devices) and the FIRST successfully
-    opened stream is returned to the caller for actual capture — never closed
-    and reopened.
+    formats are tried in order (device default rate first, native channel count
+    first for 2–8ch devices, stereo skipped entirely for mono-only devices)
+    and the FIRST successfully opened stream is returned to the caller for
+    actual capture — never closed and reopened.
 
     Args:
         audio: PyAudio instance
@@ -549,18 +553,25 @@ def _open_capture_stream(audio, device_index: Optional[int] = None) -> tuple[int
         if rate not in rates_to_try:
             rates_to_try.append(rate)
 
-    # Never probe stereo on a device that reports a single input channel
-    # (opening with more channels than supported is itself a known
-    # PortAudio/ALSA corruption trigger). Stereo-capable devices must be
-    # opened at their native layout first: Intel SOF DMICs (Raptor Lake
-    # "Digital Microphone", etc.) often only support 2ch at the PCM, and
-    # PortAudio can abort with heap corruption if open() accepts a converted
-    # 1ch stream and the callback then overruns (#666).
+    # Never probe extra channels on a device that reports a single input
+    # channel (opening with more than supported is itself a known
+    # PortAudio/ALSA corruption trigger). Devices must be opened at their
+    # native layout first: Intel SOF DMICs often only support 2ch at the
+    # PCM (#666), and HDA analog mics commonly expose 4 capture channels
+    # even when only the first pair is a mic (#813). Opening below native
+    # channel count can succeed then abort in PortAudio CleanUpStream with
+    # ``free(): corrupted unsorted chunks``. Pulse virtual devices often
+    # report 32 or 128 channels; those are not native PCM layouts, so we
+    # still try 2ch then 1ch.
     reported_channels = int(device_info.get("maxInputChannels", 0) or 0)
     if reported_channels == 1:
         channel_options = [1]
-    elif reported_channels >= 2:
+    elif reported_channels == 2:
         channel_options = [2, 1]
+    elif 2 < reported_channels <= 8:
+        channel_options = [reported_channels, 2, 1]  # HDA 4ch (#813)
+    elif reported_channels > 8:
+        channel_options = [2, 1]  # Pulse 32/128
     else:
         channel_options = [1, 2]
 
@@ -599,6 +610,79 @@ def _open_capture_stream(audio, device_index: Optional[int] = None) -> tuple[int
     return 1, 16000, None
 
 
+# Mean-square energy floor on int16 PCM before locking the N>=3 sticky channel.
+# Capture samples are raw int16 (see _record_audio np.frombuffer(..., int16));
+# RMS ≈ 100 ≈ -50 dBFS — above idle dither/ambient, well below speech.
+_STICKY_LOCK_MIN_MEAN_SQUARE = 10_000.0
+
+
+def _downmix_to_mono(
+    audio_array: "np.ndarray",
+    channels: int,
+    sticky_channel: Optional[int] = None,
+) -> tuple["np.ndarray", Optional[int]]:
+    """Downmix interleaved int16 PCM to mono.
+
+    Speech recognition engines expect mono audio.
+
+    Stereo (2ch) still averages both channels. For 3+ channels, energy-aware
+    selection is required: the microphone may not be on ch0/ch1 (HDA analog
+    capture often puts it on ch2/ch3), so keeping only the first stereo pair
+    can yield silence, while averaging all N attenuates speech when only some
+    channels are live.
+
+    While sticky is unset, each buffer returns the loudest channel by
+    mean-square energy, but sticky is only *set* when that channel's
+    mean-square exceeds :data:`_STICKY_LOCK_MIN_MEAN_SQUARE` (speech-gated
+    lock). That avoids pinning an ambient/noise channel from a silent first
+    buffer before the mic speaks. Once sticky is set, later buffers reuse it
+    until cleared on open/reconnect/cleanup so a noise burst on another input
+    cannot switch the mic mid-utterance.
+
+    Args:
+        audio_array: 1-D int16 samples with interleaved channels.
+        channels: Number of interleaved channels in *audio_array*.
+        sticky_channel: Previously selected channel for N>=3 streams, or
+            ``None`` to (re)select by loudest mean-square energy.
+
+    Returns:
+        ``(mono, sticky)`` where *mono* is 1-D int16 samples and *sticky* is
+        the channel index to reuse on the next N>=3 buffer (``None`` for
+        N<=2, or when N>=3 and no speech-gated lock yet). ``channels <= 1``
+        is a passthrough. If ``len(audio_array)`` is not divisible by
+        *channels*, leftover samples are truncated using the full N-channel
+        frame width before reshape; an empty array after truncation is
+        returned as-is (sticky unchanged for N>=3 when already set, else
+        ``None``). Stereo averages both channels; N>=3 uses the sticky index
+        when in range, otherwise the loudest channel by per-buffer
+        mean-square (ties keep the first index), locking sticky only when
+        that channel clears the non-silence energy floor.
+    """
+    if channels <= 1:
+        return audio_array, None
+    leftover = len(audio_array) % channels
+    if leftover:
+        audio_array = audio_array[: len(audio_array) - leftover]
+    if len(audio_array) == 0:
+        if channels >= 3 and sticky_channel is not None and 0 <= sticky_channel < channels:
+            return audio_array, sticky_channel
+        return audio_array, None
+    frames = audio_array.reshape(-1, channels)
+    if channels == 2:
+        return frames.mean(axis=1).astype(audio_array.dtype), None
+    if sticky_channel is not None and 0 <= sticky_channel < channels:
+        selected = int(sticky_channel)
+        return frames[:, selected].astype(audio_array.dtype), selected
+    # Cast before squaring so int16 does not overflow.
+    energy = (frames.astype("float64") ** 2).mean(axis=0)
+    selected = int(energy.argmax())
+    mono = frames[:, selected].astype(audio_array.dtype)
+    # Speech-gate: return loudest mono now, but only pin sticky on real energy.
+    if float(energy[selected]) >= _STICKY_LOCK_MIN_MEAN_SQUARE:
+        return mono, selected
+    return mono, None
+
+
 def _get_supported_channels(audio, device_index: Optional[int] = None) -> int:
     """
     Detect the supported number of channels for the audio device.
@@ -612,7 +696,8 @@ def _get_supported_channels(audio, device_index: Optional[int] = None) -> int:
         device_index: The device index to test (None for default)
 
     Returns:
-        int: Number of channels supported (1 or 2), defaults to 1
+        int: Negotiated channel count (1, 2, or native 3–8 for HDA),
+        defaults to 1
     """
     channels, _rate, stream = _open_capture_stream(audio, device_index)
     _safe_close_stream(stream)
@@ -1002,7 +1087,7 @@ class SpeechRecognitionManager:
         self.recognition_thread = None
         self.model = None
         self.recognizer = None  # Added for VOSK
-        self.command_processor = CommandProcessor()
+        self.command_processor = CommandProcessor(language=self.language)
 
         # Voice commands: None=auto (VOSK=yes, Whisper=no), True=always on, False=always off
         self._voice_commands_preference = kwargs.get("voice_commands_enabled")
@@ -1062,6 +1147,8 @@ class SpeechRecognitionManager:
         self.remote_api_model = kwargs.get("remote_api_model", "whisper-1")
         self._http_session = None
 
+        self._faster_whisper_engine = None
+
         # Audio diagnostics tracking
         self._last_audio_level = 0.0
         self._audio_level_callbacks: list[Callable[[float], None]] = []
@@ -1084,6 +1171,8 @@ class SpeechRecognitionManager:
         self._audio_stream = None
         self._pyaudio_instance = None
         self._capture_sample_rate = 16000  # Default, updated when device is opened
+        self._capture_channels = 1  # Default, updated when device is opened
+        self._capture_downmix_channel = None  # Speech-gated sticky N>=3 channel for open stream
 
         # Create models directory if it doesn't exist
         os.makedirs(MODELS_DIR, exist_ok=True)
@@ -1101,6 +1190,8 @@ class SpeechRecognitionManager:
             self._init_whispercpp()
         elif engine == "parakeet":
             self._init_parakeet()
+        elif engine == "faster_whisper":
+            self._init_faster_whisper()
         elif engine == "remote_api":
             self._init_remote_api()
         else:
@@ -1111,6 +1202,62 @@ class SpeechRecognitionManager:
         if self._voice_commands_preference is None:
             return self.engine == "vosk"
         return bool(self._voice_commands_preference)
+
+    def _init_selected_engine(self) -> None:
+        """Initialize whichever engine ``self.engine`` currently names."""
+        if self.engine == "vosk":
+            self._init_vosk()
+        elif self.engine == "whisper":
+            self._init_whisper()
+        elif self.engine == "whisper_cpp":
+            self._init_whispercpp()
+        elif self.engine == "parakeet":
+            self._init_parakeet()
+        elif self.engine == "faster_whisper":
+            self._init_faster_whisper()
+        elif self.engine == "remote_api":
+            self._init_remote_api()
+        else:
+            raise ValueError(f"Unsupported speech recognition engine: {self.engine}")
+
+    # Every live field ``reconfigure()`` can write. A failed engine switch
+    # restores this set so dictation matches the persisted config, not the
+    # attempted-but-unsaved Settings values.
+    _RECONFIGURE_STATE_ATTRS: tuple[str, ...] = (
+        "engine",
+        "model_size",
+        "language",
+        "vad_sensitivity",
+        "silence_timeout",
+        "audio_device_index",
+        "audio_device_name",
+        "_voice_commands_preference",
+        "_voice_commands_enabled",
+        "stop_sound_guard_ms",
+        "whispercpp_no_timestamps",
+        "whispercpp_no_context",
+        "whispercpp_initial_prompt",
+        "whispercpp_temperature",
+        "whispercpp_temperature_inc",
+        "whispercpp_entropy_thold",
+        "whispercpp_logprob_thold",
+        "whispercpp_no_speech_thold",
+        "whispercpp_n_threads",
+        "whispercpp_gpu_device",
+        "remote_api_url",
+        "remote_api_key",
+        "remote_api_endpoint",
+        "remote_api_model",
+    )
+
+    def _snapshot_reconfigure_state(self) -> dict[str, object]:
+        """Copy every live setting ``reconfigure()`` is about to mutate."""
+        return {name: getattr(self, name) for name in self._RECONFIGURE_STATE_ATTRS}
+
+    def _restore_reconfigure_state(self, previous: dict[str, object]) -> None:
+        """Write a ``_snapshot_reconfigure_state`` result back onto the manager."""
+        for name, value in previous.items():
+            setattr(self, name, value)
 
     def _init_vosk(self):
         """Initialize the VOSK speech recognition engine."""
@@ -1299,6 +1446,212 @@ class SpeechRecognitionManager:
 
         except (RuntimeError, OSError, ValueError) as e:
             logger.error(f"Error in Whisper transcription: {e}", exc_info=True)
+            return ""
+
+    def _download_faster_whisper_model(self) -> None:
+        """Download the faster-whisper model files with progress tracking."""
+        import requests
+
+        self._download_cancelled = False
+
+        model_dir = faster_whisper.get_model_path(self.model_size)
+        os.makedirs(model_dir, exist_ok=True)
+        logger.info(f"Downloading faster-whisper '{self.model_size}' model to {model_dir}")
+
+        bundle_files = faster_whisper.model_files(self.model_size)
+        # _stream_model_download reports 0..1 per file, so remap each file into
+        # its own slice of the bundle: the bar advances once across the whole
+        # download instead of restarting for each file.
+        outer_callback = self._download_progress_callback
+        total_files = len(bundle_files)
+
+        def file_progress(index: int, name: str) -> Callable[[float, float, str], None]:
+            def report(fraction: float, speed: float, status: str) -> None:
+                if outer_callback:
+                    outer_callback(
+                        (index + fraction) / total_files,
+                        speed,
+                        f"{name} ({index + 1}/{total_files}) - {status}",
+                    )
+
+            return report
+
+        temp_file = None
+        try:
+            for index, filename in enumerate(bundle_files):
+                dest_path = os.path.join(model_dir, filename)
+                key = faster_whisper.manifest_key(self.model_size, filename)
+                # Existence is not enough: a leftover or copied-in file must
+                # still match its pin. Verify, and only skip the download when
+                # the digest is good.
+                if os.path.exists(dest_path):
+                    try:
+                        verify_model_file(dest_path, key)
+                        continue
+                    except ChecksumError as error:
+                        logger.error(
+                            "Existing faster-whisper model file at %s is not trustworthy: %s",
+                            dest_path,
+                            error,
+                        )
+                        if expected_for(key) is None:
+                            raise
+                        try:
+                            os.remove(dest_path)
+                        except OSError as remove_error:
+                            logger.error("Could not remove %s: %s", dest_path, remove_error)
+                            raise
+                        logger.info(
+                            "Removed the unverified model file; it will be downloaded again"
+                        )
+                temp_file = dest_path + ".tmp"
+                url = faster_whisper.get_model_file_url(self.model_size, filename)
+                self._download_progress_callback = file_progress(index, filename)
+                self._stream_model_download(url, temp_file)
+
+                # Verify before the rename: CTranslate2 loads these through
+                # native code, so an unverified file must never reach a path
+                # is_model_downloaded() trusts.
+                verify_model_file(temp_file, key)
+
+                os.rename(temp_file, dest_path)
+                temp_file = None
+
+        # RequestException=Exception under the test mocks; do not catch
+        # Timeout separately (it is not a real exception type there).
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download the faster-whisper model: {e}")
+            if temp_file and os.path.exists(temp_file):
+                os.remove(temp_file)
+            msg = str(e).lower()
+            if "timeout" in msg or type(e).__name__ == "Timeout":
+                raise RuntimeError(
+                    "Model download timed out (Hugging Face may be slow or unavailable). "
+                    "Check your network and try again."
+                ) from e
+            raise RuntimeError(f"Failed to download faster-whisper model: {e}") from e
+        except (ChecksumError, OSError, RuntimeError, ValueError) as e:
+            logger.error(f"An error occurred during faster-whisper model download: {e}")
+            if temp_file and os.path.exists(temp_file):
+                os.remove(temp_file)
+            raise
+        finally:
+            self._download_progress_callback = outer_callback
+
+        logger.info("faster-whisper model downloaded successfully")
+        if self._download_progress_callback:
+            self._download_progress_callback(1.0, 0, "Complete!")
+
+    @staticmethod
+    def _faster_whisper_model_is_verified(model_size: str, model_dir: str) -> bool:
+        """Hash each bundle file against its pin. Delete only a digest/size mismatch.
+
+        An unpinned name is refused, not deleted. If remove fails, return False
+        so the caller does not hand the files to CTranslate2.
+        """
+        verified = True
+        for filename in faster_whisper.model_files(model_size):
+            path = os.path.join(model_dir, filename)
+            key = faster_whisper.manifest_key(model_size, filename)
+            try:
+                verify_model_file(path, key)
+            except ChecksumError as error:
+                logger.error("faster-whisper model file at %s is not trustworthy: %s", path, error)
+                verified = False
+                if expected_for(key) is None:
+                    continue
+                try:
+                    os.remove(path)
+                except OSError as remove_error:
+                    logger.error("Could not remove %s: %s", path, remove_error)
+                    return False
+                logger.info("Removed the unverified model file; it will be downloaded again")
+        return verified
+
+    def _init_faster_whisper(self) -> None:
+        """Initialize the faster-whisper speech recognition engine."""
+        try:
+            from .engines.faster_whisper_engine import FasterWhisperEngine
+        except ImportError as e:
+            logger.error(f"Failed to import faster-whisper engine: {e}")
+            logger.error("Please install with: pip install faster-whisper")
+            self.state = RecognitionState.ERROR
+            raise
+
+        try:
+            valid_models = list(faster_whisper.FASTER_WHISPER_MODEL_INFO.keys())
+            if self.model_size not in valid_models:
+                logger.warning(
+                    f"Model size '{self.model_size}' not valid for faster-whisper. "
+                    f"Valid options: {valid_models}. Using 'tiny' instead."
+                )
+                self.model_size = "tiny"
+
+            model_dir = faster_whisper.get_model_path(self.model_size)
+
+            # A bundle that is merely present did not necessarily come through
+            # the download path: files could be copied in, or left over from a
+            # cancelled download. CTranslate2 loads these through native code,
+            # so hash them here; a failure demotes the bundle to "not downloaded".
+            if faster_whisper.is_model_downloaded(
+                self.model_size
+            ) and not self._faster_whisper_model_is_verified(self.model_size, model_dir):
+                if faster_whisper.is_model_downloaded(self.model_size):
+                    logger.error(
+                        "Refusing to load unverified faster-whisper model at %s",
+                        model_dir,
+                    )
+                    self._model_initialized = False
+                    if self._defer_download:
+                        return
+                    raise RuntimeError(f"faster-whisper model at {model_dir} failed verification")
+
+            if not faster_whisper.is_model_downloaded(self.model_size):
+                if self._defer_download:
+                    logger.info(
+                        f"faster-whisper model '{self.model_size}' not found at {model_dir}. "
+                        "Will download when needed."
+                    )
+                    self._model_initialized = False
+                    return  # Don't block startup
+                else:
+                    logger.info(f"Downloading faster-whisper '{self.model_size}' model...")
+                    self._download_faster_whisper_model()
+
+            # NOTE: do not take _model_lock here. It is a non-reentrant Lock and
+            # reconfigure()/reinitialize_after_resume() already hold it when they
+            # call this, so acquiring it would deadlock the caller.
+            self._faster_whisper_engine = FasterWhisperEngine(
+                model_size=self.model_size,
+                language=self.language,
+            )
+            self._faster_whisper_engine.init()
+            self.model = self._faster_whisper_engine._model
+            self._model_initialized = True
+            logger.info("faster-whisper engine initialized successfully.")
+        except (ImportError, RuntimeError, OSError, ValueError, ChecksumError) as e:
+            logger.error(f"Failed to initialize faster-whisper engine: {e}", exc_info=True)
+            self.state = RecognitionState.ERROR
+            raise
+
+    def _transcribe_with_faster_whisper(self, audio_buffer: list[bytes]) -> str:
+        """
+        Transcribe audio buffer using faster-whisper.
+
+        Args:
+            audio_buffer: List of audio data chunks (16-bit PCM at 16kHz)
+
+        Returns:
+            Transcribed text
+        """
+        try:
+            if not self._faster_whisper_engine or not self._faster_whisper_engine.is_ready():
+                logger.warning("faster-whisper engine not ready during transcription")
+                return ""
+
+            return self._faster_whisper_engine.transcribe(audio_buffer)
+        except (RuntimeError, OSError, ValueError) as e:
+            logger.error(f"Error in faster-whisper transcription: {e}", exc_info=True)
             return ""
 
     def _init_whispercpp(self):
@@ -2951,6 +3304,8 @@ class SpeechRecognitionManager:
             CHANNELS, RATE, negotiated_stream = _open_capture_stream(audio, resolved_device_index)
             logger.info(f"Using {CHANNELS} channel(s) for recording")
             self._capture_sample_rate = RATE
+            self._capture_channels = CHANNELS
+            self._capture_downmix_channel = None  # New stream: speech-gated sticky unset
             logger.info(f"Using sample rate: {RATE}Hz")
 
             try:
@@ -2999,6 +3354,7 @@ class SpeechRecognitionManager:
                     # Attempt reconnection
                     if self._attempt_audio_reconnection(audio):
                         stream = self._audio_stream
+                        CHANNELS = self._capture_channels
                     else:
                         play_error_sound()
                         audio.terminate()
@@ -3040,14 +3396,15 @@ class SpeechRecognitionManager:
 
                         data = stream.read(CHUNK, exception_on_overflow=False)
 
-                        # Convert stereo to mono if necessary
+                        # Convert multi-channel capture to mono if necessary
                         # Speech recognition engines expect mono (1 channel) audio
-                        if CHANNELS == 2:
+                        if CHANNELS > 1:
                             audio_array = np.frombuffer(data, dtype=np.int16)
-                            # Reshape to (n_samples, 2) and average channels
-                            stereo_samples = audio_array.reshape(-1, 2)
-                            mono_samples = stereo_samples.mean(axis=1).astype(np.int16)
-                            data = mono_samples.tobytes()
+                            mono, selected = _downmix_to_mono(
+                                audio_array, CHANNELS, self._capture_downmix_channel
+                            )
+                            self._capture_downmix_channel = selected
+                            data = mono.tobytes()
 
                         # Resample to 16kHz if capturing at non-16kHz for Vosk/Whisper compatibility
                         if self._capture_sample_rate != 16000:
@@ -3174,6 +3531,7 @@ class SpeechRecognitionManager:
                         if self._attempt_audio_reconnection(audio):
                             logger.info("Audio reconnection successful, continuing recording")
                             stream = self._audio_stream  # Update stream reference
+                            CHANNELS = self._capture_channels
                             continue  # Continue recording with new stream
                         else:
                             logger.error("Audio reconnection failed, stopping recording")
@@ -3199,6 +3557,7 @@ class SpeechRecognitionManager:
             # Reset audio stream reference and reconnection state
             self._audio_stream = None
             self._pyaudio_instance = None
+            self._capture_downmix_channel = None
             self._reconnection_attempts = 0
             self._last_audio_error_time = 0
 
@@ -3254,6 +3613,9 @@ class SpeechRecognitionManager:
 
         elif self.engine == "parakeet":
             text = self._transcribe_with_parakeet(audio_buffer)
+
+        elif self.engine == "faster_whisper":
+            text = self._transcribe_with_faster_whisper(audio_buffer)
 
         elif self.engine == "remote_api":
             # Snapshot the HTTP session under lock to prevent race with
@@ -3424,6 +3786,11 @@ class SpeechRecognitionManager:
             f"audio_device={audio_device_index}, audio_device_name={audio_device_name}"
         )
 
+        whispercpp_attrs = tuple(
+            name for name in self._RECONFIGURE_STATE_ATTRS if name.startswith("whispercpp_")
+        )
+        previous = self._snapshot_reconfigure_state()
+
         restart_needed = force_reinit
         old_engine = self.engine
         if engine is not None and engine != self.engine:
@@ -3437,8 +3804,10 @@ class SpeechRecognitionManager:
         # Language change requires restart for both engines
         # Whisper needs to know the language for transcription
         # VOSK needs to load a different model for the new language
+        language_changed = False
         if language is not None and language != self.language:
             self.language = language
+            language_changed = True
             restart_needed = True
 
         # Parakeet never consumes catalog language. Apply after engine/language
@@ -3446,7 +3815,12 @@ class SpeechRecognitionManager:
         normalized_language = normalize_language_for_engine(self.engine, self.language)
         if normalized_language != self.language:
             self.language = normalized_language
+            language_changed = True
             restart_needed = True
+
+        # Command aliases follow the stored language (auto after Parakeet).
+        if language_changed:
+            self.command_processor.set_language(self.language)
 
         # Update VOSK specific params if provided
         if vad_sensitivity is not None:
@@ -3470,18 +3844,7 @@ class SpeechRecognitionManager:
         if "stop_sound_guard_ms" in kwargs:
             self.stop_sound_guard_ms = kwargs.get("stop_sound_guard_ms", self.stop_sound_guard_ms)
 
-        for param_name in (
-            "whispercpp_no_timestamps",
-            "whispercpp_no_context",
-            "whispercpp_initial_prompt",
-            "whispercpp_temperature",
-            "whispercpp_temperature_inc",
-            "whispercpp_entropy_thold",
-            "whispercpp_logprob_thold",
-            "whispercpp_no_speech_thold",
-            "whispercpp_n_threads",
-            "whispercpp_gpu_device",
-        ):
+        for param_name in whispercpp_attrs:
             if param_name in kwargs:
                 setattr(self, param_name, kwargs[param_name])
                 restart_needed = True
@@ -3523,28 +3886,39 @@ class SpeechRecognitionManager:
                 # Release old resources explicitly if necessary (Python's GC might handle it)
                 self.model = None
                 self.recognizer = None
+                if self._faster_whisper_engine is not None:
+                    self._faster_whisper_engine.cleanup()
+                    self._faster_whisper_engine = None
                 if old_engine == "remote_api" and self.engine != "remote_api":
                     if self._http_session is not None:
                         self._http_session.close()
                     self._http_session = None
                 try:
-                    if self.engine == "vosk":
-                        self._init_vosk()
-                    elif self.engine == "whisper":
-                        self._init_whisper()
-                    elif self.engine == "whisper_cpp":
-                        self._init_whispercpp()
-                    elif self.engine == "parakeet":
-                        self._init_parakeet()
-                    elif self.engine == "remote_api":
-                        self._init_remote_api()
-                    else:
-                        raise ValueError(f"Unsupported engine during reconfigure: {self.engine}")
+                    self._init_selected_engine()
                     logger.info("Speech engine re-initialized successfully.")
                 except Exception as e:
                     logger.error(f"Failed to re-initialize speech engine: {e}", exc_info=True)
-                    self._update_state(RecognitionState.ERROR)
-                    # Re-raise or handle appropriately
+                    # Settings reverts the pickers to the saved engine on failure.
+                    # Restore every mutated live field, then reload that engine
+                    # so dictation is not left on the failed backend in ERROR
+                    # with unsaved VAD/device/API knobs while the UI shows the
+                    # previous configuration.
+                    self._restore_reconfigure_state(previous)
+                    self._defer_download = True
+                    try:
+                        self._init_selected_engine()
+                        if self.state == RecognitionState.ERROR:
+                            self._update_state(RecognitionState.IDLE)
+                        logger.info(
+                            "Restored previous speech engine %s after failed reconfigure",
+                            self.engine,
+                        )
+                    except Exception:
+                        logger.error(
+                            "Failed to restore previous speech engine after reconfigure",
+                            exc_info=True,
+                        )
+                        self._update_state(RecognitionState.ERROR)
                     raise
                 finally:
                     self._defer_download = old_defer
@@ -3614,6 +3988,8 @@ class SpeechRecognitionManager:
             CHANNELS, RATE, new_stream = _open_capture_stream(audio_instance, resolved_device_index)
             logger.debug(f"Reconnecting with {CHANNELS} channel(s)")
             self._capture_sample_rate = RATE
+            self._capture_channels = CHANNELS
+            self._capture_downmix_channel = None  # Reopened stream: clear speech-gated sticky
             logger.debug(f"Reconnecting with sample rate: {RATE}Hz")
 
             if new_stream is None:
@@ -3675,6 +4051,9 @@ class SpeechRecognitionManager:
         with self._model_lock:
             self.model = None
             self.recognizer = None
+            if self._faster_whisper_engine is not None:
+                self._faster_whisper_engine.cleanup()
+                self._faster_whisper_engine = None
             if self._http_session is not None:
                 try:
                     self._http_session.close()
@@ -3751,6 +4130,9 @@ class SpeechRecognitionManager:
         with self._model_lock:
             self.model = None
             self.recognizer = None
+            if self._faster_whisper_engine is not None:
+                self._faster_whisper_engine.cleanup()
+                self._faster_whisper_engine = None
             if self._http_session is not None:
                 self._http_session.close()
             self._http_session = None
@@ -3765,6 +4147,8 @@ class SpeechRecognitionManager:
                     self._init_whispercpp()
                 elif self.engine == "parakeet":
                     self._init_parakeet()
+                elif self.engine == "faster_whisper":
+                    self._init_faster_whisper()
                 elif self.engine == "remote_api":
                     self._init_remote_api()
                 else:

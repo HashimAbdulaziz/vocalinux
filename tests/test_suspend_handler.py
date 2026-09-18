@@ -215,11 +215,14 @@ class TestReinitializeAfterResume(unittest.TestCase):
         mgr._model_lock.__enter__ = MagicMock(return_value=None)
         mgr._model_lock.__exit__ = MagicMock(return_value=False)
         mgr._http_session = None
+        mgr._faster_whisper_engine = None
         mgr._reconnection_attempts = 3
         mgr._update_state = MagicMock()
         mgr._init_vosk = MagicMock()
         mgr._init_whisper = MagicMock()
         mgr._init_whispercpp = MagicMock()
+        mgr._init_parakeet = MagicMock()
+        mgr._init_faster_whisper = MagicMock()
         mgr.stop_recognition = MagicMock()
         return mgr
 
@@ -246,6 +249,22 @@ class TestReinitializeAfterResume(unittest.TestCase):
         mgr.reinitialize_after_resume()
 
         mgr._init_whispercpp.assert_called_once()
+
+    def test_reinitializes_parakeet_engine(self):
+        mgr = self._make_manager()
+        mgr.engine = "parakeet"
+
+        mgr.reinitialize_after_resume()
+
+        mgr._init_parakeet.assert_called_once()
+
+    def test_reinitializes_faster_whisper_engine(self):
+        mgr = self._make_manager()
+        mgr.engine = "faster_whisper"
+
+        mgr.reinitialize_after_resume()
+
+        mgr._init_faster_whisper.assert_called_once()
 
     def test_stops_active_recognition_first(self):
         mgr = self._make_manager()

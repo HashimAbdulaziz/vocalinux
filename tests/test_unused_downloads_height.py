@@ -61,12 +61,31 @@ def test_scrollbar_stays_in_the_layout():
     assert "self.unused_models_scroll.set_overlay_scrolling(False)" in src
 
 
+def test_mapping_the_list_remeasures_it():
+    """Refresh may run before the dialog is mapped; map must remeasure so a
+    short first measurement can never leave rows clipped."""
+    src = inspect.getsource(settings_dialog)
+    assert re.search(
+        r"self\.unused_models_scroll\.connect\(\s*\"map\","
+        r"\s*lambda \*_args: self\._fit_unused_downloads_height\(\)",
+        src,
+    )
+
+
 def test_expanding_the_list_remeasures_it():
-    """The refresh measures while collapsed and possibly unmapped; expanding
-    must remeasure so a short first measurement can never leave rows clipped."""
+    """Measure while collapsed is worthless; expanding must remeasure."""
     src = inspect.getsource(settings_dialog)
     assert re.search(
         r"self\.unused_expander\.connect\(\s*\"notify::expanded\","
         r"\s*lambda \*_args: self\._fit_unused_downloads_height\(\)",
         src,
     )
+
+
+def test_unused_downloads_are_a_sibling_expander_not_nested_in_advanced():
+    """Same card chrome as Advanced, not an expander inside Advanced."""
+    src = inspect.getsource(settings_dialog)
+    assert "self.content_box.pack_start(self.unused_island" in src
+    assert "self.advanced_box.pack_start(self.unused_models_group" not in src
+    assert "self.unused_expander" in src
+    assert "_make_expander_card" in src

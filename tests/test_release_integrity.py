@@ -136,7 +136,7 @@ def test_the_manifest_covers_every_kind_of_artifact_we_publish():
     assert "merge-multiple: true" in block, "it collects one artifact, not all of them"
     checksum_line = re.search(r"sha256sum -- (.+)$", block, re.M)
     assert checksum_line, "publish-checksums does not generate SHA256SUMS"
-    for pattern in ("*.whl", "*.tar.gz", "*.AppImage", "*.flatpak"):
+    for pattern in ("*.whl", "*.tar.gz", "*.AppImage", "*.flatpak", "*.snap"):
         assert pattern in checksum_line.group(1), f"{pattern} is published but unchecksummed"
 
 
@@ -202,6 +202,13 @@ def test_flatpak_release_jobs_reuse_ci_builder_pins():
         assert "options: --privileged" in block, f"{name} is not a privileged container"
         assert _FLATPAK_BUILDER in block, f"{name} does not use the pinned builder action"
         assert f"arch: {arch}" in block
+        assert (
+            f"cache-key: flatpak-builder-{arch}-${{{{ hashFiles('packaging/flatpak/**') }}}}"
+            in block
+        ), (
+            f"{name} cache-key must start with flatpak-builder-{arch} so the "
+            "action's restore-keys prefix matches after it appends -${arch}"
+        )
         assert f"runs-on: {runner}" in block
         assert f"Vocalinux-${{{{ steps.get_version.outputs.VERSION }}}}-{arch}.flatpak" in block
         assert "actions/upload-artifact" in block, f"{name} does not upload a workflow artifact"

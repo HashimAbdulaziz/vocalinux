@@ -343,3 +343,172 @@ class TestCommandProcessorFallback(unittest.TestCase):
         """Test paste action through generic path."""
         result, actions = self.processor.process_text("paste content")
         self.assertIn("paste", actions)
+
+
+class TestLocalizedTextCommands(unittest.TestCase):
+    """Localized punctuation / line-break voice commands (issue #640)."""
+
+    def test_english_dot_alias(self):
+        """English 'dot' maps to a period."""
+        processor = CommandProcessor(language="en-us")
+        result, actions = processor.process_text("end of sentence dot")
+        self.assertEqual(result, "end of sentence.")
+        self.assertEqual(actions, [])
+
+    def test_italian_punctuation(self):
+        """Italian spoken punctuation replaces with symbols."""
+        processor = CommandProcessor(language="it")
+        cases = [
+            ("ciao virgola mondo", "ciao,mondo"),
+            ("fine punto", "fine."),
+            ("davvero punto interrogativo", "davvero?"),
+            ("bravo punto esclamativo", "bravo!"),
+            ("lista punto e virgola", "lista;"),
+            ("nota due punti", "nota:"),
+            ("prima nuova riga dopo", "prima \n dopo"),
+        ]
+        for input_text, expected in cases:
+            result, actions = processor.process_text(input_text)
+            self.assertEqual(result, expected, msg=input_text)
+            self.assertEqual(actions, [])
+
+    def test_italian_long_phrase_before_punto(self):
+        """'punto interrogativo' must not collapse to '.' + leftover words."""
+        processor = CommandProcessor(language="it")
+        result, _ = processor.process_text("sei sicuro punto interrogativo")
+        self.assertEqual(result, "sei sicuro?")
+        self.assertNotIn("interrogativo", result)
+
+    def test_french_and_german(self):
+        """French and German punctuation aliases work."""
+        fr = CommandProcessor(language="fr")
+        result, _ = fr.process_text("bonjour virgule monde point")
+        self.assertEqual(result, "bonjour,monde.")
+
+        de = CommandProcessor(language="de")
+        result, _ = de.process_text("hallo komma welt punkt")
+        self.assertEqual(result, "hallo,welt.")
+
+    def test_spanish_portuguese(self):
+        """Spanish and Portuguese punctuation aliases work."""
+        es = CommandProcessor(language="es")
+        result, _ = es.process_text("hola coma mundo punto")
+        self.assertEqual(result, "hola,mundo.")
+
+        pt = CommandProcessor(language="pt")
+        result, _ = pt.process_text("ola virgula mundo ponto")
+        self.assertEqual(result, "ola,mundo.")
+
+    def test_english_phrases_still_work_in_italian(self):
+        """English command phrases remain available when language is Italian."""
+        processor = CommandProcessor(language="it")
+        result, _ = processor.process_text("hello comma world period")
+        self.assertEqual(result, "hello,world.")
+
+    def test_auto_language_keeps_english_only_aliases(self):
+        """auto-detect does not load non-English phrase aliases."""
+        processor = CommandProcessor(language="auto")
+        self.assertNotIn("virgola", processor.text_commands)
+        self.assertIn("dot", processor.text_commands)
+        result, _ = processor.process_text("ciao virgola")
+        self.assertEqual(result, "ciao virgola")
+
+    def test_set_language_rebuilds_aliases(self):
+        """set_language swaps localized aliases without recreating the processor."""
+        processor = CommandProcessor(language="en-us")
+        self.assertNotIn("virgola", processor.text_commands)
+        processor.set_language("it")
+        self.assertIn("virgola", processor.text_commands)
+        result, _ = processor.process_text("testo virgola")
+        self.assertEqual(result, "testo,")
+        processor.set_language("auto")
+        self.assertNotIn("virgola", processor.text_commands)
+
+    def test_localized_newline_then_punctuation_keeps_break(self):
+        """Attach-left punctuation must not eat a preceding command-inserted newline."""
+        fr = CommandProcessor(language="fr")
+        result, _ = fr.process_text("bonjour nouvelle ligne point")
+        self.assertEqual(result, "bonjour \n.")
+        result, _ = fr.process_text("bonjour nouvelle ligne virgule")
+        self.assertEqual(result, "bonjour \n,")
+
+        it = CommandProcessor(language="it")
+        result, _ = it.process_text("ciao nuova riga punto")
+        self.assertEqual(result, "ciao \n.")
+
+    def test_localized_punctuation_then_newline_keeps_break(self):
+        """Attach-left trailing whitespace must not eat a following newline."""
+        fr = CommandProcessor(language="fr")
+        result, _ = fr.process_text("bonjour point nouvelle ligne")
+        self.assertEqual(result, "bonjour.\n")
+
+    def test_french_apostrophe_forms_map_to_question_mark(self):
+        """ASCII and typographic apostrophes in 'point d'interrogation' both yield '?'."""
+        fr = CommandProcessor(language="fr")
+        ascii_result, _ = fr.process_text("vrai point d'interrogation")
+        self.assertEqual(ascii_result, "vrai?")
+        self.assertNotIn("interrogation", ascii_result)
+
+        typographic_result, _ = fr.process_text("vrai point d\u2019interrogation")
+        self.assertEqual(typographic_result, "vrai?")
+        self.assertNotIn("interrogation", typographic_result)
+        self.assertNotIn(".", typographic_result)
+
+    def test_french_apostrophe_forms_map_to_exclamation(self):
+        """ASCII and typographic apostrophes in 'point d'exclamation' both yield '!'."""
+        fr = CommandProcessor(language="fr")
+        ascii_result, _ = fr.process_text("bravo point d'exclamation")
+        self.assertEqual(ascii_result, "bravo!")
+
+        typographic_result, _ = fr.process_text("bravo point d\u2019exclamation")
+        self.assertEqual(typographic_result, "bravo!")
+        self.assertNotIn("exclamation", typographic_result)
+
+    def test_locale_phrases_are_not_partially_replaced(self):
+        """Longer aliases must win over embedded shorter ones in every locale."""
+        from vocalinux.speech_recognition.command_phrases import (
+            _TEXT_COMMAND_ALIASES,
+            text_command_aliases_for,
+        )
+
+        for lang, phrases in _TEXT_COMMAND_ALIASES.items():
+            processor = CommandProcessor(language=lang)
+            for phrase, replacement in phrases.items():
+                result, _ = processor.process_text(phrase)
+                self.assertEqual(
+                    result,
+                    replacement,
+                    msg=f"{lang}: {phrase!r} -> {result!r}, expected {replacement!r}",
+                )
+
+            aliases = text_command_aliases_for(lang)
+            for apostrophe in ("'", "\u2019", "`"):
+                question = f"point d{apostrophe}interrogation"
+                if question in aliases:
+                    result, _ = processor.process_text(f"vrai {question}")
+                    self.assertEqual(result, "vrai?", msg=f"{lang}: {question!r}")
+
+
+class TestCommandPhrases(unittest.TestCase):
+    """Catalog id mapping for localized command aliases."""
+
+    def test_normalize_command_language(self):
+        """Catalog keys and auto-detect resolve to phrase-table codes."""
+        from vocalinux.speech_recognition.command_phrases import normalize_command_language
+
+        self.assertEqual(normalize_command_language("en-us"), "en")
+        self.assertEqual(normalize_command_language("en-in"), "en")
+        self.assertEqual(normalize_command_language("it"), "it")
+        self.assertEqual(normalize_command_language("auto"), "en")
+        self.assertEqual(normalize_command_language(None), "en")
+        self.assertEqual(normalize_command_language("fr"), "fr")
+
+    def test_french_aliases_include_apostrophe_variants(self):
+        """French question/exclamation phrases exist for ASCII, U+2019, and backtick."""
+        from vocalinux.speech_recognition.command_phrases import text_command_aliases_for
+
+        aliases = text_command_aliases_for("fr")
+        for apostrophe in ("'", "\u2019", "`"):
+            self.assertEqual(aliases[f"point d{apostrophe}interrogation"], "?")
+            self.assertEqual(aliases[f"point d{apostrophe}exclamation"], "!")
+        self.assertEqual(aliases["point"], ".")

@@ -3,9 +3,12 @@
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = Path(__file__).resolve().parents[1] / "install.sh"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 SETTINGS = Path(__file__).resolve().parents[1] / "src" / "vocalinux" / "ui" / "settings_dialog.py"
 AGENTS = Path(__file__).resolve().parents[1] / "AGENTS.md"
 
@@ -124,10 +127,18 @@ def test_write_pip_reqs_skip_pygobject_runtime(tmp_path) -> None:
 
 
 def test_write_pip_reqs_skip_pygobject_vosk_extra(tmp_path) -> None:
+    """The writer copies an extra's specifiers through, bounds and all.
+
+    Read out of pyproject.toml rather than written here as a literal. This
+    assertion was `["vosk>=0.3.45"]` and failed the day the extra gained an
+    upper bound, reporting an intentional pyproject edit as an installer defect.
+    """
+    with PYPROJECT.open("rb") as handle:
+        expected = tomllib.load(handle)["project"]["optional-dependencies"]["vosk"]
+    assert expected, "the vosk extra declares nothing; this would compare [] to []"
     dest = tmp_path / "vosk.txt"
     _run_reqs_writer(dest, "vosk")
-    reqs = dest.read_text().splitlines()
-    assert reqs == ["vosk>=0.3.45"]
+    assert dest.read_text().splitlines() == expected
 
 
 def test_settings_uses_engine_flag_not_removed_with_whisper() -> None:
@@ -174,3 +185,23 @@ def test_agents_does_not_claim_requirements_are_consumed() -> None:
     assert "`uv.lock` is authoritative" in text
     assert "Do not edit `requirements/*.txt` by hand" in text
     assert "https://just.systems" in text
+
+
+def test_interactive_engine_boxes_share_one_width() -> None:
+    """Boxes 4/5 used a wider frame and unpadded bullets, so the right edge
+    wandered. Keep every engine-menu echo at the same width as whisper.cpp."""
+    source = _installer_source()
+    start = source.index('echo "  │  1. WHISPER.CPP')
+    end = source.index("Choose engine [1-5]", start)
+    widths = []
+    for line in source[start:end].splitlines():
+        if 'echo "  │' not in line and 'echo "  ┌' not in line and 'echo "  └' not in line:
+            continue
+        drawn = line.split("echo ", 1)[1].strip()
+        assert drawn[0] == drawn[-1] == '"'
+        widths.append(len(drawn[1:-1]))
+    assert widths
+    assert len(set(widths)) == 1, widths
+    assert "Best performance on NVIDIA GPUs (CUDA)" not in source[start:end]
+    assert "Fast on CPU with INT8 quantization" in source[start:end]
+    assert "Checksum-verified Hugging Face models" in source[start:end]

@@ -56,6 +56,27 @@ class TestReadClipboard(unittest.TestCase):
             ["wl-paste", "--no-newline", "--type", "text"],
         )
 
+    def test_skips_wl_paste_on_xwayland_fallback(self) -> None:
+        """WAYLAND_XDOTOOL reads the X11 CLIPBOARD, not wl-paste."""
+        from vocalinux.text_injection.text_injector import DesktopEnvironment
+
+        obj = _make_injector()
+        obj.environment = DesktopEnvironment.WAYLAND_XDOTOOL
+        with patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}):
+            with patch("vocalinux.text_injection.text_injector.shutil.which") as mock_which:
+                mock_which.side_effect = lambda cmd: (
+                    f"/usr/bin/{cmd}" if cmd in ("wl-paste", "xclip") else None
+                )
+                with patch("vocalinux.text_injection.text_injector.subprocess.run") as mock_run:
+                    mock_run.return_value = MagicMock(returncode=0, stdout="from-x11")
+                    result = obj._read_clipboard()
+        self.assertEqual(result, "from-x11")
+        mock_run.assert_called_once()
+        self.assertEqual(
+            mock_run.call_args.args[0],
+            ["xclip", "-selection", "clipboard", "-o", "-t", "UTF8_STRING"],
+        )
+
     def test_xclip_requests_utf8_string_target(self):
         """xclip must request UTF8_STRING so image clipboards are not read as text."""
         obj = _make_injector()
@@ -201,7 +222,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             obj, "_read_clipboard", side_effect=["original clipboard", "injected text"]
         ):
             with patch.object(
-                obj, "_copy_to_clipboard", side_effect=lambda t: copy_calls.append(t) or True
+                obj, "_copy_to_clipboard", side_effect=lambda t, **kw: copy_calls.append(t) or True
             ):
                 with patch.object(
                     obj,
@@ -229,12 +250,12 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
         with patch.object(
             obj,
             "_read_clipboard",
-            side_effect=lambda: call_order.append("read") or "prev",
+            side_effect=lambda **kw: call_order.append("read") or "prev",
         ):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: call_order.append(f"copy:{t}") or True,
+                side_effect=lambda t, **kw: call_order.append(f"copy:{t}") or True,
             ):
                 with patch.object(
                     obj,
@@ -262,7 +283,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -296,7 +317,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -325,7 +346,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -384,7 +405,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -407,7 +428,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
         obj.wayland_tool = "ydotool"
         copy_calls: list[str] = []
 
-        def fake_copy(t: str) -> bool:
+        def fake_copy(t: str, **kwargs) -> bool:
             copy_calls.append(t)
             # injection copy succeeds; restore copy fails
             return t != "previous_content"
@@ -443,7 +464,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -471,7 +492,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -498,7 +519,9 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
         with patch.object(obj, "_read_clipboard", side_effect=["", "new text"]):
             with patch.object(obj, "_copy_to_clipboard", return_value=True):
                 with patch.object(
-                    obj, "_clear_clipboard", side_effect=lambda: clear_called.append(True) or True
+                    obj,
+                    "_clear_clipboard",
+                    side_effect=lambda **kw: clear_called.append(True) or True,
                 ):
                     with patch.object(
                         obj,
@@ -529,7 +552,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -559,7 +582,7 @@ class TestClipboardRestoreAfterInjection(unittest.TestCase):
             with patch.object(
                 obj,
                 "_copy_to_clipboard",
-                side_effect=lambda t: copy_calls.append(t) or True,
+                side_effect=lambda t, **kw: copy_calls.append(t) or True,
             ):
                 with patch.object(
                     obj,
@@ -665,7 +688,9 @@ class TestClearClipboard(unittest.TestCase):
         with patch.object(obj, "_read_clipboard", return_value=""):
             with patch.object(obj, "_copy_to_clipboard", return_value=True):
                 with patch.object(
-                    obj, "_clear_clipboard", side_effect=lambda: clear_called.append(True) or True
+                    obj,
+                    "_clear_clipboard",
+                    side_effect=lambda **kw: clear_called.append(True) or True,
                 ):
                     with patch.object(
                         obj,
@@ -764,9 +789,9 @@ class TestOverlappingClipboardRestore(unittest.TestCase):
         # clipboard); pending-target must keep restoring to "URL".
         read_values = iter(["URL", "world"])
 
-        with patch.object(obj, "_read_clipboard", side_effect=lambda: next(read_values)):
+        with patch.object(obj, "_read_clipboard", side_effect=lambda **kw: next(read_values)):
             with patch.object(
-                obj, "_copy_to_clipboard", side_effect=lambda t: copy_calls.append(t) or True
+                obj, "_copy_to_clipboard", side_effect=lambda t, **kw: copy_calls.append(t) or True
             ):
                 with patch.object(
                     obj,
@@ -781,6 +806,81 @@ class TestOverlappingClipboardRestore(unittest.TestCase):
                             self.assertTrue(obj._inject_via_clipboard_paste("hello"))
                             self.assertTrue(obj._inject_via_clipboard_paste("world"))
                             time.sleep(0.5)
+
+        self.assertEqual(copy_calls[0], "hello")
+        self.assertEqual(copy_calls[1], "world")
+        self.assertEqual(copy_calls[-1], "URL")
+        self.assertNotIn("hello", copy_calls[2:])
+        self.assertIsNone(obj._clipboard_restore_target)
+
+    def test_failed_older_paste_does_not_restore_over_newer(self) -> None:
+        """A stale paste failure must not rewind the clipboard over a newer copy."""
+        obj = _make_injector()
+        copy_calls: list[str] = []
+        nested = {"done": False}
+
+        def run_side_effect(cmd, **kwargs):
+            if not nested["done"]:
+                nested["done"] = True
+                self.assertTrue(obj._inject_via_clipboard_paste("world"))
+                raise subprocess.CalledProcessError(1, cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(obj, "_read_clipboard", side_effect=["URL", "hello"]):
+            with patch.object(
+                obj, "_copy_to_clipboard", side_effect=lambda t, **kw: copy_calls.append(t) or True
+            ):
+                with patch.object(obj, "_should_copy_to_clipboard", return_value=False):
+                    with patch.object(obj, "_should_use_terminal_paste", return_value=False):
+                        with patch.object(
+                            obj,
+                            "_clipboard_paste_command",
+                            return_value=["ydotool", "key", "ctrl+v"],
+                        ):
+                            with patch("threading.Thread"):
+                                with patch(
+                                    "vocalinux.text_injection.text_injector.subprocess.run",
+                                    side_effect=run_side_effect,
+                                ):
+                                    self.assertFalse(obj._inject_via_clipboard_paste("hello"))
+                                    # Stale failure must not rewind to "URL" over "world".
+                                    self.assertEqual(copy_calls, ["hello", "world"])
+                                    self.assertNotIn("URL", copy_calls)
+
+    def test_stale_failure_does_not_lose_original_clipboard(self) -> None:
+        """Newer overlapping restore must still land on the pre-first clipboard.
+
+        If the older paste fails after generation moved on, skipping its
+        restore must not strand the newer thread on intermediate dictated text.
+        """
+        obj = _make_injector()
+        copy_calls: list[str] = []
+        nested = {"done": False}
+
+        def run_side_effect(cmd, **kwargs):
+            if not nested["done"]:
+                nested["done"] = True
+                self.assertTrue(obj._inject_via_clipboard_paste("world"))
+                raise subprocess.CalledProcessError(1, cmd)
+            return MagicMock(returncode=0)
+
+        with patch.object(obj, "_read_clipboard", side_effect=["URL", "world"]):
+            with patch.object(
+                obj, "_copy_to_clipboard", side_effect=lambda t, **kw: copy_calls.append(t) or True
+            ):
+                with patch.object(obj, "_should_copy_to_clipboard", return_value=False):
+                    with patch.object(obj, "_should_use_terminal_paste", return_value=False):
+                        with patch.object(
+                            obj,
+                            "_clipboard_paste_command",
+                            return_value=["ydotool", "key", "ctrl+v"],
+                        ):
+                            with patch(
+                                "vocalinux.text_injection.text_injector.subprocess.run",
+                                side_effect=run_side_effect,
+                            ):
+                                self.assertFalse(obj._inject_via_clipboard_paste("hello"))
+                                time.sleep(0.5)
 
         self.assertEqual(copy_calls[0], "hello")
         self.assertEqual(copy_calls[1], "world")
