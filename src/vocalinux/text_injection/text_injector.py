@@ -711,6 +711,25 @@ class TextInjector:
         """The backend to pin, from the environment or config.json."""
         return TextInjector._resolve_backend_pin()[0]
 
+    @staticmethod
+    def _resolved_backend_from_state(
+        ibus_injector: Optional[IBusTextInjector],
+        environment: DesktopEnvironment,
+        wayland_tool: Optional[str],
+    ) -> Optional[str]:
+        """Resolve a backend from one consistent snapshot of injector state."""
+        if ibus_injector is not None and environment in (
+            DesktopEnvironment.X11_IBUS,
+            DesktopEnvironment.WAYLAND_IBUS,
+        ):
+            return "ibus"
+        if environment in (
+            DesktopEnvironment.X11,
+            DesktopEnvironment.WAYLAND_XDOTOOL,
+        ):
+            return "xdotool"
+        return wayland_tool
+
     def _resolved_backend(self) -> Optional[str]:
         """The backend actually in effect, read back from final state.
 
@@ -720,17 +739,11 @@ class TextInjector:
         ``environment``. Reading the tool first would report wtype while
         injection actually goes through XWayland.
         """
-        if self._ibus_injector is not None or self.environment in (
-            DesktopEnvironment.X11_IBUS,
-            DesktopEnvironment.WAYLAND_IBUS,
-        ):
-            return "ibus"
-        if self.environment in (
-            DesktopEnvironment.X11,
-            DesktopEnvironment.WAYLAND_XDOTOOL,
-        ):
-            return "xdotool"
-        return getattr(self, "wayland_tool", None)
+        with self._state_lock:
+            ibus_injector = self._ibus_injector
+            environment = self.environment
+            wayland_tool = getattr(self, "wayland_tool", None)
+        return self._resolved_backend_from_state(ibus_injector, environment, wayland_tool)
 
     def _warn_if_pin_not_honoured(self, pinned: str, source: Optional[str]) -> None:
         """Say so when the backend in use is not the one that was pinned.
@@ -748,7 +761,27 @@ class TextInjector:
         """
         if not source or pinned == "auto":
             return
-        resolved = self._resolved_backend()
+        with self._state_lock:
+            ibus_injector = self._ibus_injector
+            environment = self.environment
+            ibus_ready = self._ibus_ready
+            ibus_init_failed = self._ibus_init_failed
+            wayland_tool = getattr(self, "wayland_tool", None)
+        resolved = self._resolved_backend_from_state(ibus_injector, environment, wayland_tool)
+
+        if (
+            pinned == "ibus"
+            and ibus_injector is not None
+            and not ibus_ready
+            and not ibus_init_failed
+            and resolved != "ibus"
+        ):
+            logger.info(
+                "%s=%s: IBus initialization is pending; backend selection is not final.",
+                source,
+                pinned,
+            )
+            return
         # Unreachable today (every path either sets a backend or raises before
         # construction finishes), but guarded so a future path cannot render
         # "using None instead" at a user.

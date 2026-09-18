@@ -6,7 +6,7 @@ import subprocess
 import sys
 import threading
 import unittest
-from typing import Any, cast
+from typing import Any, Optional, cast
 from unittest import mock
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -575,12 +575,21 @@ class TestCheckDependencies(unittest.TestCase):
         self.assertFalse(self._silent_failure_warnings(output))
 
     def _run_with_pin(
-        self, pin, tools, ibus_available=True, bridges=True, env=None, ydotoold_ready=None
-    ):
+        self,
+        pin: Optional[str],
+        tools: tuple[str, ...],
+        ibus_available: bool = True,
+        bridges: bool = True,
+        env: Any = None,
+        ydotoold_ready: Optional[bool] = None,
+        ibus_ready: bool = False,
+    ) -> tuple[Any, list[str]]:
         """Construct through _check_dependencies with a pin; return (injector, logs).
 
         ydotoold_ready defaults to whether ydotool is installed, which is what
         every caller wanted before the daemonless fallback needed exercising.
+        ``ibus_ready`` promotes a pinned IBus path before reporting, modeling
+        the completed background initialization used by the honoured-pin cases.
         Pass it explicitly to have ydotool present but its daemon unavailable.
         """
         from vocalinux.text_injection.text_injector import DesktopEnvironment, TextInjector
@@ -618,6 +627,13 @@ class TestCheckDependencies(unittest.TestCase):
             self.assertLogs("vocalinux.text_injection.text_injector", level="DEBUG") as logs,
         ):
             obj._check_dependencies()
+            if ibus_ready:
+                obj.environment = (
+                    DesktopEnvironment.X11_IBUS
+                    if env == DesktopEnvironment.X11
+                    else DesktopEnvironment.WAYLAND_IBUS
+                )
+                obj._ibus_ready = True
             obj._warn_if_pin_not_honoured(*obj._backend_pin)
         return obj, logs.output
 
@@ -659,12 +675,16 @@ class TestCheckDependencies(unittest.TestCase):
         The pin IS honoured there, so the backend in use matches what was
         pinned; only the bypass warning is appropriate.
         """
-        _, output = self._run_with_pin("ibus", tools=("wtype", "ydotool"), bridges=False)
+        _, output = self._run_with_pin(
+            "ibus", tools=("wtype", "ydotool"), bridges=False, ibus_ready=True
+        )
         self.assertTrue([line for line in output if "overrides that check" in line])
         self.assertFalse(self._not_applied(output))
 
     def test_honoured_ibus_pin_on_bridged_compositor_warns_neither_way(self):
-        _, output = self._run_with_pin("ibus", tools=("wtype", "ydotool"), bridges=True)
+        _, output = self._run_with_pin(
+            "ibus", tools=("wtype", "ydotool"), bridges=True, ibus_ready=True
+        )
         self.assertFalse([line for line in output if "overrides that check" in line])
         self.assertFalse(self._not_applied(output))
 
@@ -1597,6 +1617,189 @@ class TestStop(unittest.TestCase):
 
 
 class TestBackgroundIBusInitialization(unittest.TestCase):
+    def test_constructor_reports_pending_ibus_pin_without_claiming_success(self):
+        """A constructed injector is not active until its background warmup succeeds."""
+        from vocalinux.text_injection.text_injector import DesktopEnvironment, TextInjector
+
+        ibus = MagicMock()
+        with (
+            patch.dict(
+                os.environ,
+                {"XDG_SESSION_TYPE": "x11", "VOCALINUX_FORCE_BACKEND": "ibus"},
+                clear=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.is_ibus_available", return_value=True),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_active_input_method",
+                return_value=True,
+            ),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_daemon_running",
+                return_value=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.IBusTextInjector", return_value=ibus),
+            patch.object(TextInjector, "_start_ibus_initialization"),
+            patch("shutil.which", return_value=None),
+            self.assertLogs("vocalinux.text_injection.text_injector", level="DEBUG") as logs,
+        ):
+            obj = TextInjector()
+
+        self.assertEqual(obj.environment, DesktopEnvironment.X11)
+        self.assertIs(obj._ibus_injector, ibus)
+        self.assertTrue(
+            [
+                line
+                for line in logs.output
+                if line.endswith("IBus initialization is pending; backend selection is not final.")
+            ],
+            f"expected pending diagnostic, got: {logs.output}",
+        )
+        self.assertFalse([line for line in logs.output if "was not applied" in line])
+
+    def test_constructor_reports_ready_ibus_as_honoured(self):
+        """A completed warmup promotes the environment before startup reporting."""
+        from vocalinux.text_injection.text_injector import DesktopEnvironment, TextInjector
+
+        ibus = MagicMock()
+
+        def initialize_now(obj: TextInjector) -> None:
+            obj._ibus_injector = ibus
+            obj._initialize_ibus_in_background()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"XDG_SESSION_TYPE": "wayland", "VOCALINUX_FORCE_BACKEND": "ibus"},
+                clear=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.is_ibus_available", return_value=True),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_active_input_method",
+                return_value=True,
+            ),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_daemon_running",
+                return_value=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.IBusTextInjector", return_value=ibus),
+            patch.object(TextInjector, "_start_ibus_initialization", initialize_now),
+            patch.object(TextInjector, "_wayland_compositor_bridges_ibus", lambda s: True),
+            patch.object(TextInjector, "_ensure_ydotoold", lambda s: True),
+            patch("shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            self.assertLogs("vocalinux.text_injection.text_injector", level="DEBUG") as logs,
+        ):
+            obj = TextInjector()
+
+        self.assertEqual(obj.environment, DesktopEnvironment.WAYLAND_IBUS)
+        self.assertTrue(obj._ibus_ready)
+        self.assertFalse([line for line in logs.output if "was not applied" in line])
+        self.assertFalse([line for line in logs.output if "initialization is pending" in line])
+
+    def test_constructor_reports_ibus_failure_before_startup_diagnostic(self):
+        """A known warmup failure must use the ordinary fallback mismatch warning."""
+        from vocalinux.text_injection.text_injector import TextInjector
+
+        ibus = MagicMock()
+        ibus.prepare_engine.side_effect = RuntimeError("not ready")
+
+        def initialize_now(obj: TextInjector) -> None:
+            obj._ibus_injector = ibus
+            obj._initialize_ibus_in_background()
+
+        with (
+            patch.dict(
+                os.environ,
+                {"XDG_SESSION_TYPE": "x11", "VOCALINUX_FORCE_BACKEND": "ibus"},
+                clear=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.is_ibus_available", return_value=True),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_active_input_method",
+                return_value=True,
+            ),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_daemon_running",
+                return_value=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.IBusTextInjector", return_value=ibus),
+            patch.object(TextInjector, "_start_ibus_initialization", initialize_now),
+            patch("shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            self.assertLogs("vocalinux.text_injection.text_injector", level="DEBUG") as logs,
+        ):
+            obj = TextInjector()
+
+        self.assertTrue(obj._ibus_init_failed)
+        self.assertTrue([line for line in logs.output if "IBus initialization failed" in line])
+        warned = [line for line in logs.output if "was not applied" in line]
+        self.assertTrue(warned, f"expected mismatch warning, got: {logs.output}")
+        self.assertIn("using xdotool instead", warned[0])
+        self.assertFalse([line for line in logs.output if "initialization is pending" in line])
+
+    def test_constructor_ibus_construction_failure_keeps_fallback_diagnostic(self):
+        """A constructor failure has no injector and still reports the fallback."""
+        from vocalinux.text_injection.text_injector import TextInjector
+
+        with (
+            patch.dict(
+                os.environ,
+                {"XDG_SESSION_TYPE": "x11", "VOCALINUX_FORCE_BACKEND": "ibus"},
+                clear=True,
+            ),
+            patch("vocalinux.text_injection.text_injector.is_ibus_available", return_value=True),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_active_input_method",
+                return_value=True,
+            ),
+            patch(
+                "vocalinux.text_injection.text_injector.is_ibus_daemon_running",
+                return_value=True,
+            ),
+            patch(
+                "vocalinux.text_injection.text_injector.IBusTextInjector",
+                side_effect=RuntimeError("constructor failed"),
+            ),
+            patch("shutil.which", side_effect=lambda name: "/usr/bin/" + name),
+            self.assertLogs("vocalinux.text_injection.text_injector", level="DEBUG") as logs,
+        ):
+            obj = TextInjector()
+
+        self.assertIsNone(obj._ibus_injector)
+        warned = [line for line in logs.output if "was not applied" in line]
+        self.assertTrue(warned, f"expected mismatch warning, got: {logs.output}")
+        self.assertIn("using xdotool instead", warned[0])
+
+    def test_late_ibus_failure_keeps_background_warning_after_pending_state(self):
+        """A later failure retains the existing background warning and fallback."""
+        from vocalinux.text_injection.text_injector import DesktopEnvironment, TextInjector
+
+        obj = _make_injector(DesktopEnvironment.WAYLAND)
+        obj._ibus_injector = MagicMock()
+        obj.wayland_tool = "ydotool"
+        obj._ibus_injector.prepare_engine.side_effect = RuntimeError("late failure")
+        obj._backend_pin = ("ibus", "VOCALINUX_FORCE_BACKEND")
+
+        with self.assertLogs("vocalinux.text_injection.text_injector", level="DEBUG") as logs:
+            obj._warn_if_pin_not_honoured(*obj._backend_pin)
+            obj._initialize_ibus_in_background()
+
+        self.assertTrue([line for line in logs.output if "initialization is pending" in line])
+        self.assertTrue([line for line in logs.output if "IBus initialization failed" in line])
+        self.assertTrue(obj._ibus_init_failed)
+        self.assertEqual(obj._resolved_backend(), "ydotool")
+
+    def test_resolved_backend_requires_ibus_environment_and_injector(self):
+        """A stale injector object cannot override the final non-IBus route."""
+        from vocalinux.text_injection.text_injector import DesktopEnvironment
+
+        obj = _make_injector(DesktopEnvironment.WAYLAND_XDOTOOL)
+        obj._ibus_injector = MagicMock()
+        obj.wayland_tool = "wtype"
+        self.assertEqual(obj._resolved_backend(), "xdotool")
+
+        obj._ibus_injector = None
+        obj.environment = DesktopEnvironment.WAYLAND_IBUS
+        self.assertEqual(obj._resolved_backend(), "wtype")
+
     def test_check_dependencies_starts_ibus_in_background(self):
         from vocalinux.text_injection.text_injector import DesktopEnvironment
 
