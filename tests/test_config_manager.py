@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 # Update import path to use the new package structure
@@ -170,6 +171,114 @@ class TestConfigManager(unittest.TestCase):
             result = config_manager.save_config()
             self.assertFalse(result)
             self.mock_logger.error.assert_called()
+
+    def _write_raw_config(self, content: str) -> None:
+        with open(self.temp_config_file, "w") as handle:
+            handle.write(content)
+
+    def _write_config(self, config: Any) -> None:
+        with open(self.temp_config_file, "w") as handle:
+            json.dump(config, handle)
+
+    def _read_config(self) -> dict[str, Any]:
+        with open(self.temp_config_file) as handle:
+            return json.load(handle)
+
+    def test_unrelated_save_preserves_first_external_backend_edit(self):
+        """A documented hand-edit must survive a Settings-style save."""
+        config_manager = ConfigManager()
+        self._write_config({"text_injection": {"backend": "wtype"}})
+
+        config_manager.set("general", "autostart", True)
+
+        self.assertTrue(config_manager.save_config())
+        saved = self._read_config()
+        self.assertEqual(saved["text_injection"]["backend"], "wtype")
+        self.assertTrue(saved["general"]["autostart"])
+
+    def test_second_external_backend_edit_survives_repeated_saves(self):
+        """Remembering the first edit must not make the second one stale again."""
+        self._write_config({"text_injection": {"backend": "wtype"}})
+        config_manager = ConfigManager()
+
+        self._write_config({"text_injection": {"backend": "ydotool"}})
+        config_manager.set("general", "autostart", True)
+        self.assertTrue(config_manager.save_config())
+        self.assertEqual(self._read_config()["text_injection"]["backend"], "ydotool")
+
+        self._write_config({"text_injection": {"backend": "xdotool"}})
+        config_manager.set("ui", "start_minimized", True)
+        self.assertTrue(config_manager.save_config())
+        saved = self._read_config()
+        self.assertEqual(saved["text_injection"]["backend"], "xdotool")
+        self.assertTrue(saved["ui"]["start_minimized"])
+
+    def test_programmatic_backend_change_wins_over_external_edit(self):
+        """An intentional in-process backend change is not discarded as stale."""
+        self._write_config({"text_injection": {"backend": "wtype"}})
+        config_manager = ConfigManager()
+
+        self._write_config({"text_injection": {"backend": "ydotool"}})
+        config_manager.set("text_injection", "backend", "xdotool")
+
+        self.assertTrue(config_manager.save_config())
+        self.assertEqual(self._read_config()["text_injection"]["backend"], "xdotool")
+
+    def test_external_auto_or_key_removal_resets_backend(self):
+        """Both documented reset forms mean auto after an unrelated save."""
+        self._write_config({"text_injection": {"backend": "wtype"}})
+        config_manager = ConfigManager()
+
+        for external in (
+            {"text_injection": {"backend": "auto"}},
+            {"text_injection": {}},
+            None,
+        ):
+            with self.subTest(external=external):
+                if external is None:
+                    os.remove(self.temp_config_file)
+                else:
+                    self._write_config(external)
+                config_manager.set("general", "autostart", True)
+                self.assertTrue(config_manager.save_config())
+                self.assertEqual(self._read_config()["text_injection"]["backend"], "auto")
+
+    def test_save_does_not_overwrite_unreadable_or_invalid_external_config(self):
+        """A Settings toggle must not repair a hand-edited file by deleting it."""
+        config_manager = ConfigManager()
+
+        for raw in ("{broken json", "[]", '{"text_injection": []}'):
+            with self.subTest(raw=raw):
+                self._write_raw_config(raw)
+                config_manager.set("general", "autostart", True)
+
+                self.assertFalse(config_manager.save_config())
+                with open(self.temp_config_file) as handle:
+                    self.assertEqual(handle.read(), raw)
+
+    def test_failed_write_does_not_advance_backend_snapshot(self):
+        """A failed save cannot make a later external edit look stale."""
+        config_manager = ConfigManager()
+        self._write_config({"text_injection": {"backend": "wtype"}})
+
+        with patch("vocalinux.ui.config_manager.json.dump", side_effect=OSError("disk full")):
+            self.assertFalse(config_manager.save_config())
+        self.assertEqual(config_manager.get("text_injection", "backend"), "auto")
+
+        self._write_config({"text_injection": {"backend": "ydotool"}})
+        config_manager.set("general", "autostart", True)
+        self.assertTrue(config_manager.save_config())
+        self.assertEqual(self._read_config()["text_injection"]["backend"], "ydotool")
+
+    def test_invalid_text_injection_shapes_do_not_break_loading(self):
+        """A hand-edited non-object section leaves text-injection defaults usable."""
+        for config in ([], {"text_injection": []}, {"text_injection": "wtype"}):
+            with self.subTest(config=config):
+                self._write_config(config)
+                config_manager = ConfigManager()
+
+                self.assertEqual(config_manager.get("text_injection", "backend"), "auto")
+                self.assertTrue(config_manager.get_bool("text_injection", "auto_capitalize"))
 
     def test_get_existing_value(self):
         """Test getting an existing configuration value from defaults."""
