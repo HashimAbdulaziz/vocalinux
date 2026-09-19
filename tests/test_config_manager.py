@@ -257,7 +257,7 @@ class TestConfigManager(unittest.TestCase):
         """A Settings toggle must not repair a hand-edited file by deleting it."""
         config_manager = ConfigManager()
 
-        for raw in ("{broken json", "[]", '{"text_injection": []}'):
+        for raw in ("{broken json", "[]"):
             with self.subTest(raw=raw):
                 self._write_raw_config(raw)
                 config_manager.set("general", "autostart", True)
@@ -265,6 +265,31 @@ class TestConfigManager(unittest.TestCase):
                 self.assertFalse(config_manager.save_config())
                 with open(self.temp_config_file) as handle:
                     self.assertEqual(handle.read(), raw)
+
+    def test_unrelated_save_preserves_malformed_text_injection_section(self):
+        """A bad backend section must not prevent unrelated Settings changes."""
+        for malformed_section in ([], "wtype", None):
+            with self.subTest(section=malformed_section):
+                self._write_config({"text_injection": malformed_section})
+                config_manager = ConfigManager()
+
+                self.assertEqual(config_manager.get("text_injection", "backend"), "auto")
+                self.assertTrue(config_manager.get_bool("text_injection", "auto_capitalize"))
+                config_manager.set("general", "autostart", True)
+
+                self.assertTrue(config_manager.save_config())
+                saved = self._read_config()
+                self.assertEqual(saved["text_injection"], malformed_section)
+                self.assertTrue(saved["general"]["autostart"])
+
+    def test_programmatic_backend_change_repairs_malformed_text_injection_section(self):
+        """An intentional backend change can replace a section that cannot hold one."""
+        self._write_config({"text_injection": []})
+        config_manager = ConfigManager()
+        config_manager.set("text_injection", "backend", "wtype")
+
+        self.assertTrue(config_manager.save_config())
+        self.assertEqual(self._read_config()["text_injection"]["backend"], "wtype")
 
     def test_save_does_not_overwrite_invalid_utf8_external_config(self):
         """A decoding failure is just as unsafe to replace as malformed JSON."""
