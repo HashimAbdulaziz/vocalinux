@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import unittest
+from collections.abc import Iterator
+from typing import Any
 from unittest import mock
 from unittest.mock import MagicMock, mock_open, patch
 
@@ -2763,7 +2765,7 @@ class TestCompositorIBusBridging(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def _fake_config(config):
+def _fake_config(config: Any) -> Iterator[None]:
     """Pretend config.json holds ``config``; ``None`` means no file at all.
 
     Kept off the filesystem on purpose: another suite patches
@@ -2818,7 +2820,7 @@ class TestConfiguredBackend(unittest.TestCase):
         with _fake_config("{not valid json"):
             self.assertEqual(TextInjector._configured_backend(), "auto")
 
-    def _warnings(self, logs):
+    def _warnings(self, logs: Any) -> list[str]:
         return [line for line in logs.output if line.startswith("WARNING")]
 
     def test_corrupt_config_warns_that_the_pin_is_ignored(self):

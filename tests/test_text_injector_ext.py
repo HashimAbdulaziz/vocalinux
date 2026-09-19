@@ -409,7 +409,7 @@ class TestCheckDependencies(unittest.TestCase):
 
         from vocalinux.text_injection.text_injector import DesktopEnvironment
 
-        def run(pinned):
+        def run(pinned: Optional[str]) -> MagicMock:
             """Drive _check_dependencies on X11 under conditions IBus would pass."""
             obj = _make_injector(DesktopEnvironment.X11)
             section = {"backend": pinned} if pinned else {}
