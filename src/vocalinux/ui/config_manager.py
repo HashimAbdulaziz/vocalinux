@@ -332,7 +332,7 @@ class ConfigManager:
 
             self._migrate_shortcuts_config(user_config)
 
-        except (json.JSONDecodeError, OSError) as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Failed to load config: {e}")
 
     def _backend_on_disk(self) -> tuple[bool, Any]:

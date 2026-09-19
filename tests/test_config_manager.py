@@ -142,6 +142,16 @@ class TestConfigManager(unittest.TestCase):
         # Verify logger.error was called for the broken JSON
         self.mock_logger.error.assert_called()
 
+    def test_load_config_invalid_utf8_uses_defaults(self):
+        """A config saved with invalid bytes must not prevent application startup."""
+        with open(self.temp_config_file, "wb") as handle:
+            handle.write(b"\xff\xfe{")
+
+        config_manager = ConfigManager()
+
+        self.assertEqual(config_manager.config, DEFAULT_CONFIG)
+        self.mock_logger.error.assert_called()
+
     def test_save_config(self):
         """Test saving configuration to file."""
         config_manager = ConfigManager()
@@ -255,6 +265,19 @@ class TestConfigManager(unittest.TestCase):
                 self.assertFalse(config_manager.save_config())
                 with open(self.temp_config_file) as handle:
                     self.assertEqual(handle.read(), raw)
+
+    def test_save_does_not_overwrite_invalid_utf8_external_config(self):
+        """A decoding failure is just as unsafe to replace as malformed JSON."""
+        config_manager = ConfigManager()
+        raw = b"\xff\xfe{"
+        with open(self.temp_config_file, "wb") as handle:
+            handle.write(raw)
+
+        config_manager.set("general", "autostart", True)
+
+        self.assertFalse(config_manager.save_config())
+        with open(self.temp_config_file, "rb") as handle:
+            self.assertEqual(handle.read(), raw)
 
     def test_failed_write_does_not_advance_backend_snapshot(self):
         """A failed save cannot make a later external edit look stale."""
