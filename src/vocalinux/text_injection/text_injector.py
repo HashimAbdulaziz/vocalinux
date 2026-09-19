@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from enum import Enum
-from typing import Optional, Tuple  # noqa: F401
+from typing import Optional, Tuple
 
 from ..utils.host_process import host_env
 from ..utils.paths import config_dir
