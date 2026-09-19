@@ -260,6 +260,7 @@ class ConfigManager:
         # The effective backend at load/save time.  It lets save_config tell an
         # intentional in-process change from a hand edit made on disk later.
         self._backend_snapshot: Any = DEFAULT_TEXT_INJECTION_BACKEND
+        self._text_injection_snapshot = copy.deepcopy(DEFAULT_CONFIG["text_injection"])
         self._ensure_config_dir()
         self.load_config()
 
@@ -325,6 +326,7 @@ class ConfigManager:
 
             # Update the default config with user settings
             self._update_dict_recursive(self.config, user_config)
+            self._text_injection_snapshot = copy.deepcopy(self.config["text_injection"])
             logger.info(f"Loaded configuration from {CONFIG_FILE}")
 
             # Migrate old config format if needed
@@ -458,10 +460,11 @@ class ConfigManager:
                     self, "_backend_snapshot", DEFAULT_TEXT_INJECTION_BACKEND
                 )
                 backend_changed = in_memory_backend != backend_snapshot
+                text_injection_changed = text_injection != self._text_injection_snapshot
 
                 if (
                     preserved_section is not _NO_PRESERVED_TEXT_INJECTION_SECTION
-                    and not backend_changed
+                    and not text_injection_changed
                 ):
                     config_to_save["text_injection"] = copy.deepcopy(preserved_section)
                 else:
@@ -476,6 +479,8 @@ class ConfigManager:
             if isinstance(text_injection, dict) and backend_written:
                 text_injection["backend"] = backend_to_save
                 self._backend_snapshot = backend_to_save
+            if isinstance(text_injection, dict):
+                self._text_injection_snapshot = copy.deepcopy(text_injection)
 
             logger.info(f"Saved configuration to {CONFIG_FILE}")
             return True

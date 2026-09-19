@@ -291,6 +291,33 @@ class TestConfigManager(unittest.TestCase):
         self.assertTrue(config_manager.save_config())
         self.assertEqual(self._read_config()["text_injection"]["backend"], "wtype")
 
+    def test_text_injection_change_repairs_malformed_section(self):
+        """A Settings change in that section must not disappear after a successful save."""
+        for key, value in (
+            ("auto_capitalize", False),
+            ("append_trailing_space", False),
+            ("paste_shortcut", "ctrl+shift+v"),
+        ):
+            with self.subTest(key=key):
+                self._write_config({"text_injection": []})
+                config_manager = ConfigManager()
+                config_manager.set("text_injection", key, value)
+
+                self.assertTrue(config_manager.save_config())
+                self.assertEqual(self._read_config()["text_injection"][key], value)
+
+    def test_failed_write_does_not_advance_text_injection_snapshot(self):
+        """A later save must still persist a text-setting change after a failed write."""
+        config_manager = ConfigManager()
+        config_manager.set("text_injection", "auto_capitalize", False)
+
+        with patch("vocalinux.ui.config_manager.json.dump", side_effect=OSError("disk full")):
+            self.assertFalse(config_manager.save_config())
+
+        self._write_config({"text_injection": []})
+        self.assertTrue(config_manager.save_config())
+        self.assertFalse(self._read_config()["text_injection"]["auto_capitalize"])
+
     def test_save_does_not_overwrite_invalid_utf8_external_config(self):
         """A decoding failure is just as unsafe to replace as malformed JSON."""
         config_manager = ConfigManager()
